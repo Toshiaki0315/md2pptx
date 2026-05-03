@@ -1,0 +1,18 @@
+# Mac OS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# IDEs and Editors
+.vscode/
+.idea/
+
+# Tool outputs (md2pptxの実行結果として生成されるファイルを除外)
+*.pptx
+
