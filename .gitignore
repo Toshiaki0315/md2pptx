@@ -16,3 +16,12 @@ env/
 # Tool outputs (md2pptxの実行結果として生成されるファイルを除外)
 *.pptx
 
+# --- Python テスト・カバレッジ関連 ---
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+coverage.xml
+nosetests.xml
+# ------------------------------------
