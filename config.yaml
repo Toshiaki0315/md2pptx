@@ -14,32 +14,35 @@ slides:
 # --- テキストのフォント設定 ---
 # 実行するOSにインストールされているフォントを指定してください。
 fonts:
-  # タイトルの設定 (h1, h2)
-  title:
-    name: "Yu Gothic"      # 游ゴシック (和文)
-    size_pt: 32           # タイトルを少し控えめに
-    bold: true            # 太字
-    color_rgb: [13, 60, 115] # プロジェクトAブランドカラー (深い青)
-
-  # 本文（pタグ）の設定
+  title_h1:          # タイトルスライド（#）用
+    name: "Meiryo"
+    size_pt: 44
+    bold: true
+  title_h2:          # コンテンツスライド（##）用
+    name: "Meiryo"
+    size_pt: 32
+    bold: true
   body:
-    name: "Yu Gothic"
+    name: "Meiryo"
     size_pt: 20
-    bold: false
-    color_rgb: [30, 30, 30] # ほぼ黒 (濃い灰色)
-
   # 箇条書き（liタグ）レベル1の設定
   bullet_level_1:
     name: "Yu Gothic"
     size_pt: 18
     bold: false
     color_rgb: [50, 50, 50] # 少し薄い灰色
-
+  inline_code:
+    name: "Consolas"
+    color_rgb: [220, 20, 60] # クリムゾンレッド
+  code_block:
+    name: "Consolas"
+    size_pt: 12
+    color_rgb: [0, 80, 160] # ブルーグレー
 # --- 画像の配置設定 ---
 images:
-  default_height_inches: 4.5 # 画像のデフォルトの高さ（インチ）を少し大きく
-  
+  default_height_inches: 3.5
   # 画像の配置位置（スライドの左上を (0,0) としたインチ単位）
   # [左からの距離, 上からの距離]
   # 16:9のスライド（10.0 x 5.625インチ）に対して、右下に配置
-  position_inches: [5.2, 1.8]
+  # ここが設定されているとオートレイアウトが効かないので消すかコメントアウト  
+  # position_inches: [5.2, 1.8]
