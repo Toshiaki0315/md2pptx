@@ -10,7 +10,9 @@ from io import BytesIO
 import os
 import argparse
 import yaml
-import traceback # エラー解析用に追加
+import traceback
+import base64
+import zlib
 
 def get_slide_size_from_layout(layout_str):
     sizes = {
@@ -35,6 +37,29 @@ def apply_font_style(run, font_config):
         rgb = font_config['color_rgb']
         font.color.rgb = RGBColor(rgb[0], rgb[1], rgb[2])
 
+def insert_image_fit(slide, img_data, left, top, max_width, max_height):
+    """画像を最大枠(max_width, max_height)に収まるようにアスペクト比を保って自動縮小・中央配置する"""
+    # 一度画像をネイティブサイズで挿入して縦横サイズを取得
+    pic = slide.shapes.add_picture(img_data, left, top)
+    
+    # 縦横の「枠に収まるための縮小率」を計算し、厳しい（小さい）方を採用
+    ratio_w = max_width / pic.width
+    ratio_h = max_height / pic.height
+    ratio = min(ratio_w, ratio_h)
+    
+    # 極端な拡大を防ぐため、元のサイズの1.5倍までを上限とする
+    ratio = min(ratio, 1.5)
+    
+    # リサイズ適用
+    pic.width = int(pic.width * ratio)
+    pic.height = int(pic.height * ratio)
+    
+    # 用意した枠の中央に美しく配置する
+    pic.left = int(left + (max_width - pic.width) / 2)
+    pic.top = int(top + (max_height - pic.height) / 2)
+    
+    return pic
+
 def add_runs_from_tag(element, paragraph, default_font_conf, fonts_conf):
     for child in element:
         if isinstance(child, NavigableString):
@@ -44,7 +69,7 @@ def add_runs_from_tag(element, paragraph, default_font_conf, fonts_conf):
                 run.text = text
                 apply_font_style(run, default_font_conf)
         elif isinstance(child, Tag):
-            if child.name in ['ul', 'ol', 'pre', 'img', 'table']: continue
+            if child.name in ['ul', 'ol', 'pre', 'img', 'table', 'blockquote']: continue
             if child.name in ['p', 'div', 'span', 'li', 'th', 'td']:
                 add_runs_from_tag(child, paragraph, default_font_conf, fonts_conf)
             else:
@@ -78,8 +103,9 @@ def markdown_to_pptx_v2(md_text, output_file, config):
     fonts_conf = config.get('fonts', {})
     images_conf = config.get('images', {})
 
-    for tag in soup.find_all(['h1', 'h2', 'p', 'li', 'img', 'pre', 'table']):
-        if tag.name == 'p' and tag.find_parent('li'): continue
+    for tag in soup.find_all(['h1', 'h2', 'p', 'li', 'img', 'pre', 'table', 'blockquote']):
+        if tag.name == 'p' and (tag.find_parent('li') or tag.find_parent('blockquote')): 
+            continue
 
         # --- 新しいスライドの作成 ---
         if tag.name in ['h1', 'h2']:
@@ -95,6 +121,33 @@ def markdown_to_pptx_v2(md_text, output_file, config):
             current_body = slide.placeholders[1].text_frame
             current_body.text = "" 
             slide_has_text = False
+
+            if not slides_conf.get('template_path'):
+                try:
+                    body_shape = current_slide.placeholders[1]
+                    # 変更前に、現在の4つのプロパティ全てを保存する
+                    original_left = body_shape.left
+                    original_top = body_shape.top
+                    original_width = body_shape.width
+                    
+                    # 高さを再計算
+                    new_height = prs.slide_height - original_top - Inches(0.5)
+                    
+                    # 座標リセットを防ぐため、leftとtopも含めて全て同時にセットし直す
+                    body_shape.left = original_left
+                    body_shape.top = original_top
+                    body_shape.width = original_width
+                    body_shape.height = new_height
+                except Exception:
+                    pass
+            
+        # --- スピーカーノートの処理 ---
+        elif tag.name == 'blockquote' and current_slide:
+            notes_slide = current_slide.notes_slide
+            text_frame = notes_slide.notes_text_frame
+            note_text = tag.get_text(strip=True)
+            if text_frame.text: text_frame.text += "\n\n" + note_text
+            else: text_frame.text = note_text
 
         # --- 画像の処理 ---
         elif tag.name == 'img' and current_slide:
@@ -114,9 +167,10 @@ def markdown_to_pptx_v2(md_text, output_file, config):
                             body_shape.left, body_shape.top = body_shape.left, body_shape.top
                             body_shape.height, body_shape.width = body_shape.height, Inches(4.8)
                         except Exception as e: pass
-                        current_slide.shapes.add_picture(img_data, Inches(5.2), Inches(1.8), width=Inches(4.3))
+                        # 最大枠を指定してフィット配置
+                        insert_image_fit(current_slide, img_data, Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
                     else:
-                        current_slide.shapes.add_picture(img_data, Inches(1.0), Inches(1.5), width=Inches(8.0))
+                        insert_image_fit(current_slide, img_data, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
             except Exception as e: print(f"Warning: 画像の挿入に失敗しました: {e}")
 
         # --- 表 (Table) の処理 ---
@@ -131,10 +185,9 @@ def markdown_to_pptx_v2(md_text, output_file, config):
                 try:
                     body_shape = current_slide.placeholders[1]
                     body_shape.left, body_shape.top = body_shape.left, body_shape.top
-                    # 高さを2.0インチに緩和してテキスト消失を防ぐ
                     body_shape.width, body_shape.height = body_shape.width, Inches(2.0)
                 except Exception as e: pass
-                table_top = Inches(2.8) # 少しゆとりを持たせる
+                table_top = Inches(2.8) 
             else:
                 table_top = Inches(1.5)
                 
@@ -159,22 +212,54 @@ def markdown_to_pptx_v2(md_text, output_file, config):
                             font_conf = fonts_conf.get('table_body', {'name': 'Meiryo', 'size_pt': 12})
                             
                         add_runs_from_tag(col, p, font_conf, fonts_conf)
-                        
             slide_has_text = True
 
-        # --- コードブロックの処理 ---
+        # --- コードブロック / Mermaid の処理 ---
         elif tag.name == 'pre' and current_body:
-            if not slide_has_text and len(current_body.paragraphs) == 1 and not current_body.paragraphs[0].text:
-                p = current_body.paragraphs[0]
+            code_tag = tag.find('code')
+            is_mermaid = False
+            
+            if code_tag and code_tag.get('class'):
+                classes = code_tag.get('class')
+                if 'language-mermaid' in classes or 'mermaid' in classes:
+                    is_mermaid = True
+
+            if is_mermaid:
+                mermaid_text = code_tag.get_text()
+                try:
+                    print("INFO: Mermaid図形をAPIで生成中...")
+                    compressed = zlib.compress(mermaid_text.encode('utf-8'), 9)
+                    encoded = base64.urlsafe_b64encode(compressed).decode('ascii')
+                    img_url = f"https://kroki.io/mermaid/png/{encoded}"
+
+                    response = requests.get(img_url, timeout=15)
+                    response.raise_for_status()
+                    img_data = BytesIO(response.content)
+
+                    # Mermaid画像にも「はみ出し防止」のリサイズを適用
+                    if slide_has_text:
+                        try:
+                            body_shape = current_slide.placeholders[1]
+                            body_shape.left, body_shape.top = body_shape.left, body_shape.top
+                            body_shape.height, body_shape.width = body_shape.height, Inches(4.8)
+                        except Exception as e: pass
+                        insert_image_fit(current_slide, img_data, Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
+                    else:
+                        insert_image_fit(current_slide, img_data, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
+                except Exception as e:
+                    print(f"Warning: Mermaid図形の生成に失敗しました: {e}")
             else:
-                p = current_body.add_paragraph()
-                
-            run = p.add_run()
-            run.text = tag.get_text()
-            font_conf = fonts_conf.get('code_block', {'name': 'Consolas', 'size_pt': 12})
-            apply_font_style(run, font_conf)
-            if 'color_rgb' not in font_conf: run.font.color.rgb = RGBColor(0, 80, 160)
-            slide_has_text = True
+                if not slide_has_text and len(current_body.paragraphs) == 1 and not current_body.paragraphs[0].text:
+                    p = current_body.paragraphs[0]
+                else:
+                    p = current_body.add_paragraph()
+                    
+                run = p.add_run()
+                run.text = tag.get_text()
+                font_conf = fonts_conf.get('code_block', {'name': 'Consolas', 'size_pt': 12})
+                apply_font_style(run, font_conf)
+                if 'color_rgb' not in font_conf: run.font.color.rgb = RGBColor(0, 80, 160)
+                slide_has_text = True
 
         # --- テキスト・リストの処理 ---
         elif tag.name in ['li', 'p'] and current_body:
