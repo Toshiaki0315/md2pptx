@@ -3,7 +3,8 @@ import os
 from unittest.mock import MagicMock, patch
 from pptx.util import Inches
 from io import BytesIO
-from md2pptx import PPTXGenerator
+from generator import PPTXGenerator
+from utils import insert_image_fit
 
 # --- フィクスチャ（テスト用の共通設定） ---
 @pytest.fixture
@@ -47,13 +48,13 @@ def test_insert_image_fit():
     mock_slide.shapes.add_picture.return_value = mock_pic
 
     # 枠を (横500, 縦500) に設定してリサイズ実行
-    pic = PPTXGenerator.insert_image_fit(mock_slide, b"dummy_data", 0, 0, 500, 500)
+    pic = insert_image_fit(mock_slide, b"dummy_data", 0, 0, 500, 500)
 
     # ロジック内で最大1.5倍に制限(キャップ)されているため、1.5倍になる。
     assert pic.width == 150
     assert pic.height == 300
 
-@patch('md2pptx.PPTXGenerator.insert_image_fit')
+@patch('processors.insert_image_fit')
 @patch('requests.get')
 def test_markdown_integration(mock_get, mock_insert_image, base_config, tmp_path):
     """Markdownのパースからスライド生成までの一連の結合テスト"""

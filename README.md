@@ -23,7 +23,7 @@ Markdownファイルから美しいPowerPoint（.pptx）スライドを自動生
 Python 3.x 環境が必要です。以下の外部ライブラリをインストールしてください。
 
 ```bash
-pip install python-pptx markdown beautifulsoup4 requests PyYAML
+pip install python-pptx markdown beautifulsoup4 requests PyYAML Pygments
 ```
 
 ## 🚀 使い方
