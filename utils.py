@@ -133,7 +133,9 @@ def append_code_textbox(generator, content, language=None):
         
     textbox = generator.current_slide.shapes.add_textbox(box_left, box_top, box_width, box_height)
     textbox.fill.solid()
-    textbox.fill.fore_color.rgb = RGBColor(40, 44, 52) # 濃いグレー（Monokai風）
+    
+    bg_color = generator.config.get('theme', {}).get('code_bg_color', [40, 44, 52]) if hasattr(generator, 'config') else [40, 44, 52]
+    textbox.fill.fore_color.rgb = RGBColor(*bg_color)
     
     tf = textbox.text_frame
     tf.word_wrap = True
@@ -149,3 +151,25 @@ def append_code_textbox(generator, content, language=None):
     apply_syntax_highlight(p, content, language, conf)
     
     generator.slide_has_text = True
+
+def auto_shrink_text(slide):
+    """スライド内のテキスト行数が多い場合、フォントサイズと余白を自動で縮小してはみ出しを防ぐ"""
+    if not slide: return
+    try:
+        if len(slide.placeholders) > 1:
+            body = slide.placeholders[1]
+            if not body.has_text_frame: return
+            
+            tf = body.text_frame
+            line_count = sum(1 for p in tf.paragraphs if p.text.strip())
+            
+            if line_count > 6: # 6行を超えたら縮小を開始（より早めに設定）
+                shrink_factor = max(0.6, 1.0 - (line_count - 6) * 0.06) # 縮小率を強化
+                for p in tf.paragraphs:
+                    if p.space_after:
+                        p.space_after = Pt(p.space_after.pt * shrink_factor)
+                    for run in p.runs:
+                        if run.font.size:
+                            run.font.size = Pt(int(run.font.size.pt * shrink_factor))
+    except Exception:
+        pass

@@ -10,8 +10,18 @@ slides:
   # 16:9 (ワイド画面), 4:3 (標準), 16:10, A4
   # template_path が指定されている場合、この設定は無視されます。
   layout: "16:9"
+  
+  # スライド番号の表示（右下）
+  show_slide_number: true
+
+# --- カラーテーマの一括設定 ---
+theme:
+  accent_color: [0, 112, 192]   # 見出し・テーブルヘッダーの基本色
+  text_color: [50, 50, 50]      # 本文の基本色
+  code_bg_color: [40, 44, 52]   # コードブロックの背景色
 
 # --- テキストのフォント設定 ---
+# ※テーマ設定がある場合、color_rgbはテーマの色で上書きされます。
 # 実行するOSにインストールされているフォントを指定してください。
 fonts:
   title_h1:          # タイトルスライド（#）用
@@ -24,7 +34,7 @@ fonts:
     bold: true
   body:
     name: "Meiryo"
-    size_pt: 20
+    size_pt: 18
   # 箇条書き（liタグ）レベル1の設定
   bullet_level_1:
     name: "Yu Gothic"

@@ -8,6 +8,8 @@ from utils import apply_font_style
 
 from processors import (
     process_heading,
+    process_h3,
+    process_hr,
     process_blockquote,
     process_image,
     process_table,
@@ -68,23 +70,41 @@ class PPTXGenerator:
         
         # タイトルスライドの自動生成（フロントマターがある場合）
         if front_matter and front_matter.get('title'):
+            from pptx.enum.text import MSO_AUTO_SIZE
+            
             self.current_slide = self.prs.slides.add_slide(self.prs.slide_layouts[0])
-            self.current_slide.shapes.title.text = str(front_matter.get('title'))
+            
+            title_shape = self.current_slide.shapes.title
+            if title_shape:
+                title_shape.text_frame.word_wrap = True
+                title_shape.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+                title_shape.text = str(front_matter.get('title'))
+                
+                for run in title_shape.text_frame.paragraphs[0].runs:
+                    apply_font_style(run, self.fonts_conf.get('title_h1', self.fonts_conf.get('title')))
+            
             subtitle_text = []
             if 'subtitle' in front_matter: subtitle_text.append(str(front_matter['subtitle']))
             if 'author' in front_matter: subtitle_text.append(str(front_matter['author']))
             if 'date' in front_matter: subtitle_text.append(str(front_matter['date']))
-            if subtitle_text and len(self.current_slide.placeholders) > 1:
-                self.current_slide.placeholders[1].text = "\n".join(subtitle_text)
             
-            for run in self.current_slide.shapes.title.text_frame.paragraphs[0].runs:
-                apply_font_style(run, self.fonts_conf.get('title_h1', self.fonts_conf.get('title')))
+            if subtitle_text and len(self.current_slide.placeholders) > 1:
+                sub_shape = self.current_slide.placeholders[1]
+                sub_shape.text_frame.word_wrap = True
+                sub_shape.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+                sub_shape.text = "\n".join(subtitle_text)
+                
+                # サブタイトルには少し小さめのフォントサイズを適用
+                sub_font_conf = self.fonts_conf.get('body', {'name': 'Meiryo', 'size_pt': 20})
+                for p in sub_shape.text_frame.paragraphs:
+                    for run in p.runs:
+                        apply_font_style(run, sub_font_conf)
 
         html = markdown.markdown(md_text, extensions=['extra', 'fenced_code', 'sane_lists'])
         soup = BeautifulSoup(html, 'html.parser')
 
         # 2. タグとコメントの処理
-        for element in soup.find_all(['h1', 'h2', 'p', 'li', 'img', 'pre', 'table', 'blockquote', lambda tag: isinstance(tag, Comment)]):
+        for element in soup.find_all(['h1', 'h2', 'h3', 'hr', 'p', 'li', 'img', 'pre', 'table', 'blockquote', lambda tag: isinstance(tag, Comment)]):
             if isinstance(element, Comment):
                 text = element.strip()
                 if text.startswith('layout:'):
@@ -101,6 +121,11 @@ class PPTXGenerator:
             if tag.name in ['h1', 'h2']:
                 self.forced_layout = None # 新しいスライドでリセット
                 process_heading(self, tag)
+            elif tag.name == 'h3' and self.current_body:
+                process_h3(self, tag)
+            elif tag.name == 'hr':
+                self.forced_layout = None
+                process_hr(self, tag)
             elif tag.name == 'blockquote' and self.current_slide:
                 process_blockquote(self, tag)
             elif tag.name == 'img' and self.current_slide:
@@ -112,4 +137,30 @@ class PPTXGenerator:
             elif tag.name in ['li', 'p'] and self.current_body:
                 process_text(self, tag)
 
+        if self.current_slide:
+            from utils import auto_shrink_text
+            auto_shrink_text(self.current_slide)
+            
+        # スライド番号の自動挿入 (Task 4)
+        if self.slides_conf.get('show_slide_number', True):
+            from pptx.enum.text import PP_ALIGN
+            from pptx.util import Pt
+            from pptx.dml.color import RGBColor
+            
+            for i, slide in enumerate(self.prs.slides):
+                if i == 0: continue # タイトルスライドは除外
+                
+                left = self.prs.slide_width - Inches(1.0)
+                top = self.prs.slide_height - Inches(0.5)
+                width = Inches(0.8)
+                height = Inches(0.3)
+                
+                txBox = slide.shapes.add_textbox(left, top, width, height)
+                p = txBox.text_frame.paragraphs[0]
+                p.alignment = PP_ALIGN.RIGHT
+                run = p.add_run()
+                run.text = str(i)
+                run.font.size = Pt(14)
+                run.font.color.rgb = RGBColor(128, 128, 128)
+            
         self.prs.save(output_file)

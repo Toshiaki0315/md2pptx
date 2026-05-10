@@ -24,6 +24,21 @@ def main():
     try:
         with open(args.config, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
+            
+        # theme設定の適用 (Task 7)
+        if 'theme' in config:
+            theme = config['theme']
+            accent = theme.get('accent_color')
+            if accent:
+                for k in ['title_h1', 'title_h2', 'title_h3', 'table_header']:
+                    if k not in config.get('fonts', {}): config.setdefault('fonts', {})[k] = {}
+                    config['fonts'][k]['color_rgb'] = accent
+            
+            text_color = theme.get('text_color')
+            if text_color:
+                for k in ['body', 'bullet_level_1', 'table_body']:
+                    if k not in config.get('fonts', {}): config.setdefault('fonts', {})[k] = {}
+                    config['fonts'][k]['color_rgb'] = text_color
         with open(args.input, "r", encoding="utf-8") as f:
             content = f.read()
             

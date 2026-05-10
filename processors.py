@@ -3,6 +3,7 @@ from io import BytesIO
 import zlib
 import base64
 from pptx.util import Inches
+from pptx.dml.color import RGBColor
 
 from utils import (
     apply_font_style,
@@ -10,20 +11,32 @@ from utils import (
     shrink_body_shape,
     add_runs_from_tag,
     append_text_block,
-    append_code_textbox
+    append_code_textbox,
+    auto_shrink_text
 )
 
 def process_heading(generator, tag):
     """見出しタグの処理とスライド作成"""
+    if generator.current_slide:
+        auto_shrink_text(generator.current_slide)
+        
     layout_idx = 0 if tag.name == 'h1' else 1
     generator.current_slide = generator.prs.slides.add_slide(generator.prs.slide_layouts[layout_idx])
-    generator.current_slide.shapes.title.text = tag.get_text()
     
-    style_key = 'title_h1' if tag.name == 'h1' else 'title_h2'
-    for run in generator.current_slide.shapes.title.text_frame.paragraphs[0].runs:
-        apply_font_style(run, generator.fonts_conf.get(style_key, generator.fonts_conf.get('title')))
+    from pptx.enum.text import MSO_AUTO_SIZE
+    title_shape = generator.current_slide.shapes.title
+    if title_shape:
+        title_shape.text_frame.word_wrap = True
+        title_shape.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        title_shape.text = tag.get_text()
+        
+        style_key = 'title_h1' if tag.name == 'h1' else 'title_h2'
+        for run in title_shape.text_frame.paragraphs[0].runs:
+            apply_font_style(run, generator.fonts_conf.get(style_key, generator.fonts_conf.get('title')))
 
     generator.current_body = generator.current_slide.placeholders[1].text_frame
+    generator.current_body.word_wrap = True
+    generator.current_body.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     generator.current_body.text = "" 
     generator.slide_has_text = False
 
@@ -34,6 +47,65 @@ def process_heading(generator, tag):
             o_left, o_top, o_width = body_shape.left, body_shape.top, body_shape.width
             new_height = generator.prs.slide_height - o_top - Inches(0.5)
             body_shape.left, body_shape.top, body_shape.width, body_shape.height = o_left, o_top, o_width, new_height
+        except Exception:
+            pass
+
+def process_h3(generator, tag):
+    """H3見出し（スライド内セクション区切り）の処理"""
+    if not tag.get_text(strip=True): return
+    from pptx.util import Pt
+    
+    p = generator.current_body.add_paragraph()
+    # 箇条書きを完全に無効化
+    from pptx.oxml.xmlchemy import OxmlElement
+    p.level = 0
+    p_pr = p._element.get_or_add_pPr()
+    buNone = OxmlElement('a:buNone')
+    p_pr.insert(0, buNone)
+    
+    p.space_before = Pt(10)
+    p.space_after = Pt(2)
+    
+    run = p.add_run()
+    run.text = tag.get_text()
+    
+    font_conf = generator.fonts_conf.get('title_h3', {'name': 'Meiryo', 'size_pt': 20, 'bold': True})
+    apply_font_style(run, font_conf)
+    
+    # 段落レベルでフォントサイズを固定（はみ出し防止のベース）
+    if 'size_pt' in font_conf:
+        p.font.size = Pt(font_conf['size_pt'])
+    generator.slide_has_text = True
+
+def process_hr(generator, tag):
+    """水平線（---）による新しいスライド（タイトルなし）の生成"""
+    if generator.current_slide:
+        from utils import auto_shrink_text
+        auto_shrink_text(generator.current_slide)
+        
+    generator.current_slide = generator.prs.slides.add_slide(generator.prs.slide_layouts[1])
+    
+    # タイトルシェイプを削除して上部から広く使えるようにする
+    if generator.current_slide.shapes.title:
+        sp = generator.current_slide.shapes.title._element
+        sp.getparent().remove(sp)
+        
+    generator.current_body = generator.current_slide.placeholders[1].text_frame
+    generator.current_body.word_wrap = True
+    
+    from pptx.enum.text import MSO_AUTO_SIZE
+    generator.current_body.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    
+    generator.current_body.text = "" 
+    generator.slide_has_text = False
+    
+    if not generator.slides_conf.get('template_path'):
+        try:
+            body_shape = generator.current_slide.placeholders[1]
+            o_left, o_top, o_width = body_shape.left, body_shape.top, body_shape.width
+            new_top = Inches(0.5)
+            new_height = generator.prs.slide_height - new_top - Inches(0.5)
+            body_shape.left, body_shape.top, body_shape.width, body_shape.height = o_left, new_top, o_width, new_height
         except Exception:
             pass
 
@@ -92,6 +164,8 @@ def process_table(generator, tag):
                 
                 if col.name == 'th':
                     font_conf = generator.fonts_conf.get('table_header', {'name': 'Meiryo', 'size_pt': 14, 'bold': True, 'color_rgb': [255, 255, 255]})
+                    cell.fill.solid()
+                    cell.fill.fore_color.rgb = RGBColor(31, 73, 125) # 濃い青をデフォルトに設定
                 else:
                     font_conf = generator.fonts_conf.get('table_body', {'name': 'Meiryo', 'size_pt': 12})
                     
