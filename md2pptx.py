@@ -1,8 +1,12 @@
 """MarkdownをPowerPoint（.pptx）に変換するCLIエントリポイント。"""
 
+from __future__ import annotations
+
 import os
 import sys
 import argparse
+from typing import Any
+
 import yaml
 import traceback
 
@@ -13,7 +17,7 @@ ACCENT_FONT_KEYS = ['title_h1', 'title_h2', 'title_h3', 'table_header']
 TEXT_FONT_KEYS = ['body', 'bullet_level_1', 'table_body']
 
 
-def apply_theme(config):
+def apply_theme(config: dict[str, Any]) -> dict[str, Any]:
     """theme設定を各フォント設定の color_rgb に展開する"""
     theme = config.get('theme') or {}
     if not theme:
@@ -32,19 +36,19 @@ def apply_theme(config):
     return config
 
 
-def load_config(path):
+def load_config(path: str) -> dict[str, Any]:
     """YAML設定ファイルを読み込む（空ファイルの場合は空の設定を返す）"""
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
-def read_text_file(path):
+def read_text_file(path: str) -> str:
     """UTF-8のテキストファイルを読み込む"""
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
 
-def parse_args(argv=None):
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """コマンドライン引数を解析する"""
     parser = argparse.ArgumentParser(description="MarkdownファイルをPowerPointに変換します。")
     parser.add_argument("input", help="変換するMarkdownファイルのパス")
@@ -53,7 +57,7 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     """CLIのエントリポイント（0=成功, 1=失敗 の終了コードを返す）"""
     print("INFO: 変換処理を開始します...")
     args = parse_args(argv)

@@ -1,10 +1,16 @@
+"""Markdown全体を読み取り、プレゼンテーションを組み立てるジェネレーター"""
+
+from __future__ import annotations
+
 import os
+from typing import Any
+
 import yaml
 from pptx import Presentation
 from pptx.util import Inches
 import markdown
 from bs4 import BeautifulSoup, Comment, Tag
-from utils import apply_font_style
+from utils import FontConfig, apply_font_style
 
 from processors import (
     process_heading,
@@ -24,21 +30,22 @@ TARGET_TAGS = ['h1', 'h2', 'h3', 'hr', 'p', 'li', 'img', 'pre', 'table', 'blockq
 class PPTXGenerator:
     """MarkdownをPowerPointに変換するジェネレータークラス"""
 
-    def __init__(self, config):
-        self.config = config or {}
-        self.slides_conf = self.config.get('slides') or {}
-        self.fonts_conf = self.config.get('fonts') or {}
-        self.images_conf = self.config.get('images') or {}
-        
-        self.prs = None
-        self.current_slide = None
-        self.current_body = None
-        self.slide_has_text = False
-        self.forced_layout = None
-        
+    def __init__(self, config: dict[str, Any] | None) -> None:
+        self.config: dict[str, Any] = config or {}
+        self.slides_conf: dict[str, Any] = self.config.get('slides') or {}
+        self.fonts_conf: dict[str, FontConfig] = self.config.get('fonts') or {}
+        self.images_conf: dict[str, Any] = self.config.get('images') or {}
+
+        # python-pptx のオブジェクト群（型が動的なため Any で保持する）
+        self.prs: Any = None
+        self.current_slide: Any = None
+        self.current_body: Any = None
+        self.slide_has_text: bool = False
+        self.forced_layout: str | None = None
+
         self._init_presentation()
 
-    def _init_presentation(self):
+    def _init_presentation(self) -> None:
         """プレゼンテーションの初期化（テンプレート読み込み・サイズ設定）"""
         template_path = self.slides_conf.get('template_path')
         if template_path and os.path.exists(template_path):
@@ -49,7 +56,7 @@ class PPTXGenerator:
             self.prs.slide_width = width
             self.prs.slide_height = height
 
-    def _get_slide_size(self, layout_str):
+    def _get_slide_size(self, layout_str: str) -> tuple[int, int]:
         sizes = {
             "16:9": (Inches(10), Inches(5.625)),
             "4:3":  (Inches(10), Inches(7.5)),
@@ -58,11 +65,11 @@ class PPTXGenerator:
         }
         return sizes.get(layout_str, sizes["16:9"])
 
-    def generate(self, md_text, output_file):
+    def generate(self, md_text: str, output_file: str) -> None:
         """MarkdownをパースしてPPTXを生成するメイン処理"""
-        
+
         # 1. フロントマターの解析
-        front_matter = {}
+        front_matter: dict[str, Any] = {}
         if md_text.startswith('---'):
             parts = md_text.split('---', 2)
             if len(parts) >= 3:

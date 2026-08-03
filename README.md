@@ -63,6 +63,17 @@ pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov-report=t
 ```
 現在のカバレッジは **99%**（127テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得はすべてモック化しているため、テスト実行時にネットワーク接続は不要です。
 
+### 4. 型チェック（mypy）
+全モジュールに型アノテーションを付与しています。設定は `mypy.ini` にあります。
+```bash
+pip install mypy
+mypy .
+```
+サードパーティ製ライブラリの型スタブは任意です。導入するとより厳密にチェックできます。
+```bash
+pip install types-requests types-PyYAML types-Markdown
+```
+
 ## 📝 Markdownの書き方とスライドへの反映
 
 ### 1. スライドの生成とレイアウト
