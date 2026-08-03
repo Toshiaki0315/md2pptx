@@ -18,7 +18,8 @@ def apply_syntax_highlight(p, text, language, font_conf):
             lexer = get_lexer_by_name(language, stripall=False)
         else:
             lexer = guess_lexer(text)
-    except:
+    except Exception:
+        # 未知の言語や判定不能なコードはハイライトなしのプレーンテキストとして扱う
         lexer = get_lexer_by_name('text')
         
     style = get_style_by_name('monokai') # 濃い背景に合うmonokaiを使用
@@ -89,7 +90,12 @@ def add_runs_from_tag(generator, element, paragraph, default_font_conf):
                     run.font.color.rgb = RGBColor(rgb[0], rgb[1], rgb[2])
 
 def shrink_body_shape(generator, width_inches=4.8, max_height_inches=None):
-    """テキスト枠を指定サイズに縮める（レイアウト調整用ヘルパー）"""
+    """テキスト枠を指定サイズに縮める（レイアウト調整用ヘルパー）
+
+    注意: 下の left/top の自己代入は削除しないこと。プレースホルダーの位置・サイズは
+    スライドレイアウトからの継承値であり、一部だけを書き換えると継承が切れて
+    残りの値が 0 になる。継承値を明示的に書き戻してから変更する必要がある。
+    """
     try:
         body_shape = generator.current_slide.placeholders[1]
         body_shape.left, body_shape.top = body_shape.left, body_shape.top

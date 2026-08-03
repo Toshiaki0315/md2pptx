@@ -39,6 +39,8 @@ python md2pptx.py input.md -o output.pptx -c config.yaml
 * `-o`, `--output`: 出力するPPTXファイル名（デフォルト: `output.pptx`）
 * `-c`, `--config`: スタイル設定を記述したYAMLファイル（デフォルト: `config.yaml`）
 
+終了コードは成功時が `0`、入力・設定ファイルの不備や書き込み失敗時が `1` です（CI等での判定に利用できます）。
+
 ## 🧪 テスト環境の構築と実行
 
 本プロジェクトでは品質維持のため、`pytest` によるユニットテストを導入しています。
@@ -57,8 +59,9 @@ pytest
 ### 3. カバレッジ（網羅率）の計測
 コードの何割がテストされているかを確認し、レポートを表示します。
 ```bash
-pytest --cov=md2pptx --cov-report=term-missing
+pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov-report=term-missing
 ```
+現在のカバレッジは **99%**（127テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得はすべてモック化しているため、テスト実行時にネットワーク接続は不要です。
 
 ## 📝 Markdownの書き方とスライドへの反映
 
