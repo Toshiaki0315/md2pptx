@@ -201,10 +201,10 @@ def add_runs_from_tag(
 
 def shrink_body_shape(
     generator: PPTXGenerator,
-    width_inches: float = 4.8,
-    max_height_inches: float | None = None,
+    width: Length,
+    max_height: Length | None = None,
 ) -> None:
-    """テキスト枠を指定サイズに縮める（レイアウト調整用ヘルパー）
+    """テキスト枠を指定サイズ（EMU）に縮める（レイアウト調整用ヘルパー）
 
     注意: 下の left/top の自己代入は削除しないこと。プレースホルダーの位置・サイズは
     スライドレイアウトからの継承値であり、一部だけを書き換えると継承が切れて
@@ -213,9 +213,9 @@ def shrink_body_shape(
     try:
         body_shape = generator.current_slide.placeholders[1]
         body_shape.left, body_shape.top = body_shape.left, body_shape.top
-        body_shape.width = Inches(width_inches)
-        if max_height_inches:
-            body_shape.height = Inches(max_height_inches)
+        body_shape.width = width
+        if max_height:
+            body_shape.height = max_height
     except Exception:
         pass
 
@@ -241,22 +241,23 @@ def append_code_textbox(
     generator: PPTXGenerator, content: str, language: str | None = None
 ) -> None:
     """独立したテキストボックスを作成し、背景色付きでコードを挿入する"""
+    layout = generator.layout
     if generator.slide_has_text or generator.forced_layout == '2-column':
-        shrink_body_shape(generator, width_inches=4.5)
-        box_left = Inches(5.0)
-        box_top = Inches(1.5)
-        box_width = Inches(4.5)
-        box_height = Inches(3.8)
+        shrink_body_shape(generator, layout.code_split_body_width)
+        box_left = layout.code_split_left
+        box_top = layout.content_top
+        box_width = layout.code_split_width
+        box_height = layout.content_height
     elif generator.forced_layout == 'center':
-        box_left = Inches(1.5)
-        box_top = Inches(1.5)
-        box_width = Inches(7.0)
-        box_height = Inches(3.8)
+        box_left = layout.code_center_left
+        box_top = layout.content_top
+        box_width = layout.code_center_width
+        box_height = layout.content_height
     else:
-        box_left = Inches(1.0)
-        box_top = Inches(2.0)
-        box_width = Inches(8.0)
-        box_height = Inches(3.0)
+        box_left = layout.content_left
+        box_top = layout.code_full_top
+        box_width = layout.content_width
+        box_height = layout.code_full_height
 
     textbox = generator.current_slide.shapes.add_textbox(box_left, box_top, box_width, box_height)
     textbox.fill.solid()

@@ -60,7 +60,7 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
         try:
             body_shape = generator.current_slide.placeholders[1]
             o_left, o_top, o_width = body_shape.left, body_shape.top, body_shape.width
-            new_height = generator.prs.slide_height - o_top - Inches(0.5)
+            new_height = generator.layout.body_height_for(o_top)
             body_shape.left, body_shape.top, body_shape.width, body_shape.height = o_left, o_top, o_width, new_height
         except Exception:
             pass
@@ -119,7 +119,7 @@ def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
             body_shape = generator.current_slide.placeholders[1]
             o_left, o_top, o_width = body_shape.left, body_shape.top, body_shape.width
             new_top = Inches(0.5)
-            new_height = generator.prs.slide_height - new_top - Inches(0.5)
+            new_height = generator.layout.body_height_for(new_top)
             body_shape.left, body_shape.top, body_shape.width, body_shape.height = o_left, new_top, o_width, new_height
         except Exception:
             pass
@@ -150,6 +150,24 @@ def place_image(
         img_data = downscale_image(img_data, width, height, dpi)
     insert_image_fit(generator.current_slide, img_data, left, top, width, height)
 
+def place_image_full(generator: PPTXGenerator, img_data: ImageSource) -> None:
+    """コンテンツ領域いっぱいに図を配置する"""
+    layout = generator.layout
+    place_image(
+        generator, img_data,
+        layout.content_left, layout.content_top, layout.content_width, layout.content_height,
+    )
+
+def place_image_split(generator: PPTXGenerator, img_data: ImageSource) -> None:
+    """本文枠を左に縮め、図を右半分に配置する（2カラム）"""
+    layout = generator.layout
+    shrink_body_shape(generator, layout.split_body_width)
+    place_image(
+        generator, img_data,
+        layout.split_image_left, layout.content_top,
+        layout.split_image_width, layout.content_height,
+    )
+
 def load_image(src: str) -> ImageSource:
     """画像URLならダウンロードし、ローカルパスならそのまま返す"""
     if src.startswith(('http://', 'https://')):
@@ -177,19 +195,19 @@ def process_image(generator: PPTXGenerator, tag: Tag) -> None:
                 img_data = downscale_image(img_data, generator.prs.slide_width, fixed_height, dpi)
             generator.current_slide.shapes.add_picture(img_data, Inches(pos[0]), Inches(pos[1]), height=fixed_height)
         elif generator.forced_layout == 'center':
-            place_image(generator, img_data, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
+            place_image_full(generator, img_data)
         else:
             # オートレイアウト
             if generator.slide_has_text or generator.forced_layout == '2-column':
-                shrink_body_shape(generator, width_inches=4.8)
-                place_image(generator, img_data, Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
+                place_image_split(generator, img_data)
             else:
-                place_image(generator, img_data, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
+                place_image_full(generator, img_data)
     except Exception as e:
         print(f"Warning: 画像の挿入に失敗しました: {e}")
 
 def process_table(generator: PPTXGenerator, tag: Tag) -> None:
     """表の挿入処理"""
+    layout = generator.layout
     rows = tag.find_all('tr')
     if not rows: return
     
@@ -197,12 +215,17 @@ def process_table(generator: PPTXGenerator, tag: Tag) -> None:
     num_cols = max(len(row.find_all(['th', 'td'])) for row in rows)
     
     if generator.slide_has_text:
-        shrink_body_shape(generator, width_inches=8.0, max_height_inches=2.0)
-        table_top = Inches(2.8) 
+        shrink_body_shape(
+            generator, layout.content_width, max_height=layout.table_split_body_height
+        )
+        table_top = layout.table_split_top
     else:
-        table_top = Inches(1.5)
-        
-    table_shape = generator.current_slide.shapes.add_table(num_rows, num_cols, Inches(1.0), table_top, Inches(8.0), Inches(0.8))
+        table_top = layout.content_top
+
+    table_shape = generator.current_slide.shapes.add_table(
+        num_rows, num_cols,
+        layout.content_left, table_top, layout.content_width, layout.table_height,
+    )
     table = table_shape.table
     
     for row_idx, row in enumerate(rows):
@@ -246,10 +269,9 @@ def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
                 return
 
             if generator.slide_has_text:
-                shrink_body_shape(generator, width_inches=4.8)
-                place_image(generator, BytesIO(image), Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
+                place_image_split(generator, BytesIO(image))
             else:
-                place_image(generator, BytesIO(image), Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
+                place_image_full(generator, BytesIO(image))
         except Exception as e:
             print(f"Warning: Mermaid図形の生成に失敗しました: {e}")
     else:

@@ -19,13 +19,14 @@ from PIL import Image
 from bs4 import BeautifulSoup
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.util import Inches, Pt
+from pptx.util import Emu, Inches, Pt
 
 import md2pptx
 import mermaid_renderer
 import processors
 import utils
 from generator import PPTXGenerator
+from layout import SlideLayout
 from mermaid_renderer import MermaidRenderError, mermaid_conf, render_mermaid
 from md2pptx import apply_theme, load_config, main, parse_args, read_text_file
 from processors import (
@@ -399,7 +400,7 @@ class TestAddRunsFromTag:
 class TestShrinkBodyShape:
     def test_width_is_applied(self, gen_with_slide):
         """指定した幅が本文枠に反映される"""
-        shrink_body_shape(gen_with_slide, width_inches=4.8)
+        shrink_body_shape(gen_with_slide, Inches(4.8))
         assert gen_with_slide.current_slide.placeholders[1].width == Inches(4.8)
 
     def test_inherited_geometry_is_kept(self, gen_with_slide):
@@ -411,19 +412,19 @@ class TestShrinkBodyShape:
         shape = gen_with_slide.current_slide.placeholders[1]
         top, height = shape.top, shape.height
 
-        shrink_body_shape(gen_with_slide, width_inches=4.8)
+        shrink_body_shape(gen_with_slide, Inches(4.8))
 
         assert shape.left > 0
         assert (shape.top, shape.height) == (top, height)
 
     def test_max_height_is_applied(self, gen_with_slide):
-        """max_height_inches を渡すと高さも縮む"""
-        shrink_body_shape(gen_with_slide, width_inches=8.0, max_height_inches=2.0)
+        """max_height を渡すと高さも縮む"""
+        shrink_body_shape(gen_with_slide, Inches(8.0), max_height=Inches(2.0))
         assert gen_with_slide.current_slide.placeholders[1].height == Inches(2.0)
 
     def test_without_slide_is_noop(self, gen):
         """スライド未作成でも例外にならない"""
-        shrink_body_shape(gen, width_inches=4.8)
+        shrink_body_shape(gen, Inches(4.8))
 
 
 class TestAppendTextBlock:
@@ -605,7 +606,7 @@ class TestProcessHeading:
 
     def test_body_correction_failure_is_ignored(self, gen, mocker):
         """本文枠の補正に失敗してもスライド生成は継続する"""
-        mocker.patch("processors.Inches", side_effect=ValueError("broken"))
+        mocker.patch.object(SlideLayout, "body_height_for", side_effect=ValueError("broken"))
 
         process_heading(gen, parse_md("## 中身").find("h2"))
         assert gen.current_slide.shapes.title.text == "中身"
@@ -665,7 +666,7 @@ class TestProcessHr:
 
     def test_body_correction_failure_is_ignored(self, gen_with_slide, mocker):
         """本文枠の補正に失敗してもスライド生成は継続する"""
-        mocker.patch("processors.Inches", side_effect=ValueError("broken"))
+        mocker.patch.object(SlideLayout, "body_height_for", side_effect=ValueError("broken"))
 
         process_hr(gen_with_slide, parse_md("---").find("hr"))
         assert len(gen_with_slide.prs.slides) == 2
@@ -954,6 +955,110 @@ class TestProcessText:
 
         process_text(gen, parse_md("* 項目").find("li"))
         assert gen.current_body.paragraphs[0].runs[0].font.size == Pt(18)
+
+
+# =====================================================================
+# layout.py
+# =====================================================================
+
+
+class TestSlideLayout:
+    """スライドサイズからの配置寸法の導出"""
+
+    #: 16:9 における従来の固定値（この値を再現できることが移行の前提）
+    LEGACY_16_9 = {
+        "content_left": 1.0,
+        "content_top": 1.5,
+        "content_width": 8.0,
+        "content_height": 3.8,
+        "split_body_width": 4.8,
+        "code_split_body_width": 4.5,
+        "split_image_left": 5.2,
+        "split_image_width": 4.5,
+        "table_split_top": 2.8,
+        "table_split_body_height": 2.0,
+        "code_split_left": 5.0,
+        "code_split_width": 4.5,
+        "code_center_left": 1.5,
+        "code_center_width": 7.0,
+        "code_full_top": 2.0,
+        "code_full_height": 3.0,
+    }
+
+    @pytest.mark.parametrize("name, expected", sorted(LEGACY_16_9.items()))
+    def test_16_9_reproduces_legacy_values(self, name, expected):
+        """16:9では従来の固定値と一致する（既存資料の見た目を変えないための回帰テスト）"""
+        layout = SlideLayout(Inches(10), Inches(5.625))
+        assert Emu(getattr(layout, name)).inches == pytest.approx(expected, abs=0.001)
+
+    @pytest.mark.parametrize(
+        "width_in, height_in",
+        [(10, 5.625), (10, 7.5), (10, 6.25), (11.69, 8.27)],  # 16:9 / 4:3 / 16:10 / A4
+    )
+    def test_content_area_follows_slide_size(self, width_in, height_in):
+        """コンテンツ領域はスライドサイズに追従し、左右・下の余白は一定になる"""
+        layout = SlideLayout(Inches(width_in), Inches(height_in))
+
+        assert Emu(layout.content_width).inches == pytest.approx(width_in - 2.0, abs=0.001)
+        assert Emu(layout.content_height).inches == pytest.approx(
+            height_in - 1.5 - 0.325, abs=0.001
+        )
+
+    @pytest.mark.parametrize("width_in", [10, 11.69, 13.333])
+    def test_split_image_reaches_right_margin(self, width_in):
+        """2カラム時の図は、スライド幅によらず右端の余白まで広がる"""
+        layout = SlideLayout(Inches(width_in), Inches(7.5))
+        right_edge = Emu(layout.split_image_left + layout.split_image_width).inches
+        assert right_edge == pytest.approx(width_in - 0.3, abs=0.001)
+
+    def test_body_height_fits_in_slide(self):
+        """本文枠の高さはスライド下端に余白を残す"""
+        layout = SlideLayout(Inches(10), Inches(7.5))
+        assert Emu(layout.body_height_for(Inches(1.75))).inches == pytest.approx(5.25)
+
+    def test_built_from_presentation(self, base_config):
+        """ジェネレーターはプレゼンテーションの実サイズからレイアウトを構築する"""
+        base_config["slides"]["layout"] = "A4"
+        gen = PPTXGenerator(base_config)
+
+        assert gen.layout.width == gen.prs.slide_width
+        assert gen.layout.height == gen.prs.slide_height
+
+
+class TestLayoutAdaptsToSlideSize:
+    """画角を変えたときに図・表が追従することの結合テスト"""
+
+    MD = "## 図のスライド\n\n![img]({png})\n\n## 表のスライド\n\n| A | B |\n|---|---|\n| 1 | 2 |\n"
+
+    def _generate(self, base_config, layout_name, tmp_path, png_file):
+        base_config["slides"]["layout"] = layout_name
+        gen = PPTXGenerator(base_config)
+        gen.generate(self.MD.format(png=png_file), str(tmp_path / "out.pptx"))
+        return gen
+
+    @pytest.mark.parametrize("layout_name", ["16:9", "4:3", "A4"])
+    def test_content_stays_inside_the_slide(self, base_config, layout_name, tmp_path, png_file):
+        """どの画角でも図・表がスライドからはみ出さない"""
+        gen = self._generate(base_config, layout_name, tmp_path, png_file)
+
+        for slide in gen.prs.slides:
+            for shape in slide.shapes:
+                assert shape.left + shape.width <= gen.prs.slide_width
+                assert shape.top + shape.height <= gen.prs.slide_height
+
+    def test_wide_slide_uses_the_extra_width(self, base_config, tmp_path, png_file):
+        """A4のような横長の画角では、表が広がった幅を使う"""
+        narrow = self._generate(base_config, "16:9", tmp_path, png_file)
+        wide = self._generate(base_config, "A4", tmp_path, png_file)
+
+        def table_width(gen):
+            for slide in gen.prs.slides:
+                for shape in slide.shapes:
+                    if shape.has_table:
+                        return shape.width
+            raise AssertionError("表が見つかりません")
+
+        assert table_width(wide) > table_width(narrow)
 
 
 # =====================================================================

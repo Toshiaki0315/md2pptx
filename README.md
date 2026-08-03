@@ -8,6 +8,7 @@ Markdownファイルから美しいPowerPoint（.pptx）スライドを自動生
 * **賢いオートレイアウト**
   * テキストと画像（または表）が混在している場合、自動で2カラムレイアウトや上下分割レイアウトに整形します[cite: 1, 2, 3]。
   * 画像はスライドからはみ出さないよう、アスペクト比を維持して自動リサイズ・中央配置されます。
+  * 画像・表・コード枠の配置は**スライドの画角に追従**します（`16:9` / `4:3` / `16:10` / `A4`）。
 * **エンジニア向け記法の完全サポート**
   * **インライン装飾・コードブロック:** 等幅フォントやシンタックスカラーを適用[cite: 2]。
   * **Mermaid図形の自動生成:** ````mermaid ```` ブロックを自動的にPNG画像に変換してスライドに挿入[cite: 3]。[Kroki API](https://kroki.io/)（自己ホスト可）またはローカルの mermaid-cli を選択できます。
@@ -59,9 +60,9 @@ pytest
 ### 3. カバレッジ（網羅率）の計測
 コードの何割がテストされているかを確認し、レポートを表示します。
 ```bash
-pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov=mermaid_renderer --cov-report=term-missing
+pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov=mermaid_renderer --cov=layout --cov-report=term-missing
 ```
-現在のカバレッジは **99%**（167テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
+現在のカバレッジは **99%**（196テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
 
 ### 4. 型チェック（mypy）
 全モジュールに型アノテーションを付与しています。設定は `mypy.ini` にあります。
