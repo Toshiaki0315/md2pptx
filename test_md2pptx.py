@@ -9,10 +9,12 @@
 
 import base64
 import os
+from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import markdown
 import pytest
+from PIL import Image
 from bs4 import BeautifulSoup
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -20,6 +22,7 @@ from pptx.util import Inches, Pt
 
 import md2pptx
 import processors
+import utils
 from generator import PPTXGenerator
 from md2pptx import apply_theme, load_config, main, parse_args, read_text_file
 from processors import (
@@ -33,11 +36,13 @@ from processors import (
     process_text,
 )
 from utils import (
+    DEFAULT_IMAGE_DPI,
     add_runs_from_tag,
     append_code_textbox,
     append_text_block,
     apply_font_style,
     auto_shrink_text,
+    downscale_image,
     hex_to_rgb,
     insert_image_fit,
     shrink_body_shape,
@@ -165,6 +170,153 @@ class TestApplyFontStyle:
         run = new_paragraph().add_run()
         apply_font_style(run, config)
         assert run.font.name is None
+
+
+class TestDownscaleImage:
+    """埋め込み画像の縮小（ファイルサイズ削減）"""
+
+    def _png(self, tmp_path, width, height, name="big.png"):
+        """指定サイズのグラデーション画像（圧縮しにくい＝縮小効果が出る）を作る"""
+        img = Image.new("RGB", (width, height))
+        img.putdata(
+            [((x * 7) % 256, (y * 13) % 256, (x + y) % 256)
+             for y in range(height) for x in range(width)]
+        )
+        path = tmp_path / name
+        img.save(path)
+        return str(path)
+
+    def test_large_image_is_resampled(self, tmp_path):
+        """表示サイズに対して過大な画像は縮小される"""
+        source = self._png(tmp_path, 1600, 800)
+        result = downscale_image(source, Inches(4.0), Inches(3.0), dpi=100)
+
+        with Image.open(result) as img:
+            assert img.width == 400  # 4.0インチ × 100dpi
+            assert img.height == 200  # 縦横比を維持
+
+    def test_small_image_is_untouched(self, tmp_path):
+        """必要解像度以下の画像は再エンコードせず、そのまま返す"""
+        source = self._png(tmp_path, 100, 50)
+        assert downscale_image(source, Inches(8.0), Inches(3.8), dpi=150) is source
+
+    def test_never_upscales(self, tmp_path):
+        """元より大きな表示枠でも拡大はしない"""
+        source = self._png(tmp_path, 200, 100)
+        result = downscale_image(source, Inches(10.0), Inches(10.0), dpi=300)
+        assert result is source
+
+    def test_file_size_is_reduced(self, tmp_path):
+        """縮小によって実際にバイト数が減る"""
+        source = self._png(tmp_path, 2000, 1000)
+        result = downscale_image(source, Inches(4.0), Inches(3.0), dpi=100)
+
+        assert isinstance(result, BytesIO)
+        assert result.getbuffer().nbytes < os.path.getsize(source)
+
+    def test_dpi_controls_resolution(self, tmp_path):
+        """dpiの指定が出力解像度に反映される"""
+        source = self._png(tmp_path, 2000, 1000)
+
+        with Image.open(downscale_image(source, Inches(4.0), Inches(3.0), dpi=50)) as low:
+            with Image.open(downscale_image(source, Inches(4.0), Inches(3.0), dpi=200)) as high:
+                assert low.width == 200
+                assert high.width == 800
+
+    def test_original_is_kept_when_resize_grows(self, tmp_path, mocker):
+        """再エンコードで逆に大きくなる画像（図版など）は元データを使う"""
+        source = self._png(tmp_path, 2000, 1000)
+        mocker.patch("utils._source_size", return_value=1)
+
+        assert downscale_image(source, Inches(4.0), Inches(3.0), dpi=100) is source
+
+    def test_jpeg_format_is_preserved(self, tmp_path):
+        """JPEGはJPEGのまま再エンコードされる"""
+        img = Image.new("RGB", (1600, 800), (10, 120, 200))
+        path = tmp_path / "big.jpg"
+        img.save(path)
+
+        with Image.open(downscale_image(str(path), Inches(4.0), Inches(3.0), dpi=100)) as out:
+            assert out.format == "JPEG"
+
+    def test_bytesio_source_is_rewound(self, tmp_path):
+        """メモリ上の画像を渡した場合も、読み取り位置を先頭に戻して返す"""
+        source = self._png(tmp_path, 100, 50)
+        buffer = BytesIO(open(source, "rb").read())
+        buffer.read()  # 読み取り位置を末尾へ
+
+        result = downscale_image(buffer, Inches(8.0), Inches(3.8), dpi=150)
+        assert result.tell() == 0
+
+    def test_broken_image_falls_back(self, capsys):
+        """画像として読めないデータは警告のみ出し、元データを返す"""
+        broken = BytesIO(b"not an image")
+        result = downscale_image(broken, Inches(4.0), Inches(3.0), dpi=100)
+
+        assert result is broken
+        assert "画像の縮小に失敗" in capsys.readouterr().out
+
+    def test_bytesio_large_image_is_downscaled(self, tmp_path):
+        """メモリ上の画像（ダウンロードした画像・Mermaid図）も縮小対象になる"""
+        source = self._png(tmp_path, 2000, 1000)
+        buffer = BytesIO(open(source, "rb").read())
+
+        result = downscale_image(buffer, Inches(4.0), Inches(3.0), dpi=100)
+
+        assert result is not buffer
+        with Image.open(result) as img:
+            assert img.width == 400
+
+    def test_size_of_unmeasurable_source_is_none(self):
+        """バイト数を取得できないデータでも例外にしない"""
+        broken = MagicMock()
+        broken.tell.side_effect = OSError("測定不能")
+        assert utils._source_size(broken) is None
+
+
+class TestImageDpiConfig:
+    """images.downscale / images.dpi の設定"""
+
+    def test_default_dpi(self, gen):
+        """既定では縮小が有効"""
+        assert processors.image_dpi(gen) == DEFAULT_IMAGE_DPI
+
+    def test_dpi_from_config(self, base_config):
+        """dpi を設定で変更できる"""
+        base_config["images"]["dpi"] = 96
+        assert processors.image_dpi(PPTXGenerator(base_config)) == 96
+
+    def test_downscale_can_be_disabled(self, base_config):
+        """downscale: false で縮小を無効化できる"""
+        base_config["images"]["downscale"] = False
+        assert processors.image_dpi(PPTXGenerator(base_config)) is None
+
+    @patch("processors.insert_image_fit")
+    @patch("processors.downscale_image")
+    def test_place_image_downscales(self, mock_downscale, _mock_fit, gen_with_slide, png_file):
+        """縮小が有効な場合は表示枠のサイズで縮小してから配置する"""
+        processors.place_image(
+            gen_with_slide, png_file, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8)
+        )
+        mock_downscale.assert_called_once_with(
+            png_file, Inches(8.0), Inches(3.8), DEFAULT_IMAGE_DPI
+        )
+
+    @patch("processors.insert_image_fit")
+    @patch("processors.downscale_image")
+    def test_place_image_skips_when_disabled(
+        self, mock_downscale, mock_fit, base_config, png_file
+    ):
+        """縮小が無効な場合は元画像のまま配置する"""
+        base_config["images"]["downscale"] = False
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        processors.place_image(
+            gen, png_file, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8)
+        )
+        mock_downscale.assert_not_called()
+        assert mock_fit.call_args[0][1] is png_file
 
 
 class TestInsertImageFit:
