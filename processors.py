@@ -9,12 +9,14 @@ import base64
 from typing import TYPE_CHECKING, cast
 
 from bs4 import Tag
-from pptx.util import Inches
+from pptx.util import Inches, Length
 from pptx.dml.color import RGBColor
 
 from utils import (
+    DEFAULT_IMAGE_DPI,
     ImageSource,
     apply_font_style,
+    downscale_image,
     insert_image_fit,
     shrink_body_shape,
     add_runs_from_tag,
@@ -133,6 +135,26 @@ def process_blockquote(generator: PPTXGenerator, tag: Tag) -> None:
     note_text = tag.get_text(strip=True)
     text_frame.text = text_frame.text + "\n\n" + note_text if text_frame.text else note_text
 
+def image_dpi(generator: PPTXGenerator) -> int | None:
+    """埋め込み画像の解像度を返す（images.downscale が false の場合は None＝縮小しない）"""
+    if not generator.images_conf.get('downscale', True):
+        return None
+    return generator.images_conf.get('dpi', DEFAULT_IMAGE_DPI)
+
+def place_image(
+    generator: PPTXGenerator,
+    img_data: ImageSource,
+    left: Length,
+    top: Length,
+    width: Length,
+    height: Length,
+) -> None:
+    """設定に応じて画像を縮小したうえで、指定した枠に収めて配置する"""
+    dpi = image_dpi(generator)
+    if dpi:
+        img_data = downscale_image(img_data, width, height, dpi)
+    insert_image_fit(generator.current_slide, img_data, left, top, width, height)
+
 def load_image(src: str) -> ImageSource:
     """画像URLならダウンロードし、ローカルパスならそのまま返す"""
     if src.startswith(('http://', 'https://')):
@@ -153,17 +175,21 @@ def process_image(generator: PPTXGenerator, tag: Tag) -> None:
         pos = generator.images_conf.get('position_inches')
         
         if pos and len(pos) >= 2:
-            # YAMLの固定位置
-            generator.current_slide.shapes.add_picture(img_data, Inches(pos[0]), Inches(pos[1]), height=Inches(generator.images_conf.get('default_height_inches', 3.5)))
+            # YAMLの固定位置（幅は縦横比に従うため、上限はスライド幅とする）
+            fixed_height = Inches(generator.images_conf.get('default_height_inches', 3.5))
+            dpi = image_dpi(generator)
+            if dpi:
+                img_data = downscale_image(img_data, generator.prs.slide_width, fixed_height, dpi)
+            generator.current_slide.shapes.add_picture(img_data, Inches(pos[0]), Inches(pos[1]), height=fixed_height)
         elif generator.forced_layout == 'center':
-            insert_image_fit(generator.current_slide, img_data, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
+            place_image(generator, img_data, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
         else:
             # オートレイアウト
             if generator.slide_has_text or generator.forced_layout == '2-column':
                 shrink_body_shape(generator, width_inches=4.8)
-                insert_image_fit(generator.current_slide, img_data, Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
+                place_image(generator, img_data, Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
             else:
-                insert_image_fit(generator.current_slide, img_data, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
+                place_image(generator, img_data, Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
     except Exception as e:
         print(f"Warning: 画像の挿入に失敗しました: {e}")
 
@@ -240,9 +266,9 @@ def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
 
             if generator.slide_has_text:
                 shrink_body_shape(generator, width_inches=4.8)
-                insert_image_fit(generator.current_slide, BytesIO(response.content), Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
+                place_image(generator, BytesIO(response.content), Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
             else:
-                insert_image_fit(generator.current_slide, BytesIO(response.content), Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
+                place_image(generator, BytesIO(response.content), Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
         except Exception as e:
             print(f"Warning: Mermaid図形の生成に失敗しました: {e}")
     else:

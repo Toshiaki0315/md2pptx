@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import collections
 import collections.abc
+import os
 from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any, Union
 
+from PIL import Image
 from pptx.util import Emu, Inches, Length, Pt
 from pptx.dml.color import RGBColor
 from bs4 import NavigableString, Tag
@@ -26,6 +28,12 @@ FontConfig = dict[str, Any]
 
 #: 画像データとして受け付ける型（ローカルパス、またはメモリ上のバイト列）
 ImageSource = Union[str, IO[bytes]]
+
+#: 画像を再サンプリングする際の既定解像度（PowerPointの「図の圧縮」の印刷品質相当）
+DEFAULT_IMAGE_DPI = 150
+
+#: JPEGを再エンコードする際の品質
+JPEG_QUALITY = 90
 
 
 def hex_to_rgb(hex_str: str | None) -> RGBColor | None:
@@ -72,6 +80,73 @@ def apply_font_style(run: _Run, font_config: FontConfig | None) -> None:
     if 'color_rgb' in font_config:
         rgb = font_config['color_rgb']
         font.color.rgb = RGBColor(rgb[0], rgb[1], rgb[2])
+
+def _rewind(img_data: ImageSource) -> ImageSource:
+    """ファイルライクな画像データを先頭に巻き戻して返す"""
+    if hasattr(img_data, 'seek'):
+        img_data.seek(0)
+    return img_data
+
+def _source_size(img_data: ImageSource) -> int | None:
+    """元画像のバイト数を返す（取得できない場合は None）"""
+    try:
+        if isinstance(img_data, str):
+            return os.path.getsize(img_data)
+        position = img_data.tell()
+        img_data.seek(0, os.SEEK_END)
+        size = img_data.tell()
+        img_data.seek(position)
+        return size
+    except Exception:
+        return None
+
+def downscale_image(
+    img_data: ImageSource,
+    max_width: Length,
+    max_height: Length,
+    dpi: int = DEFAULT_IMAGE_DPI,
+) -> ImageSource:
+    """表示サイズに対して過大な画像を再サンプリングし、埋め込みサイズを削減する
+
+    スライド上の表示サイズと指定DPIから必要な画素数を求め、それを超える分だけ縮小する。
+    拡大は行わない（元が小さい画像はそのまま返す）。
+
+    再エンコードでかえってサイズが増える画像（色数の少ない図版など、元のPNGが
+    よく圧縮されているケース）では元データをそのまま使う。
+    画像として読めない・保存できない場合も同様に元データを返し、変換自体は止めない。
+    """
+    target_w = max(1, int(Emu(int(max_width)).inches * dpi))
+    target_h = max(1, int(Emu(int(max_height)).inches * dpi))
+
+    try:
+        _rewind(img_data)
+
+        with Image.open(img_data) as img:
+            # 既に十分小さい画像は再エンコードしない（無駄な劣化とCPUを避ける）
+            if img.width <= target_w and img.height <= target_h:
+                return _rewind(img_data)
+
+            image_format = img.format or 'PNG'
+            resized = img.copy()
+            resized.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+
+            buffer = BytesIO()
+            save_options: dict[str, Any] = {'dpi': (dpi, dpi)}
+            if image_format == 'JPEG':
+                save_options['quality'] = JPEG_QUALITY
+            elif image_format == 'PNG':
+                save_options['optimize'] = True
+            resized.save(buffer, format=image_format, **save_options)
+
+        original_size = _source_size(img_data)
+        if original_size is not None and buffer.getbuffer().nbytes >= original_size:
+            return _rewind(img_data)
+
+        buffer.seek(0)
+        return buffer
+    except Exception as e:
+        print(f"Warning: 画像の縮小に失敗したため元の画像を使用します: {e}")
+        return _rewind(img_data)
 
 def insert_image_fit(
     slide: Slide,
