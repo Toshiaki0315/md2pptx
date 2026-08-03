@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import requests
 from io import BytesIO
-import zlib
-import base64
 from typing import TYPE_CHECKING, cast
 
 from bs4 import Tag
 from pptx.util import Inches, Length
 from pptx.dml.color import RGBColor
 
+from mermaid_renderer import mermaid_conf, render_mermaid
 from utils import (
     DEFAULT_IMAGE_DPI,
     ImageSource,
@@ -28,12 +27,8 @@ from utils import (
 if TYPE_CHECKING:
     from generator import PPTXGenerator
 
-# 外部API（画像取得・Mermaid変換）のタイムアウト秒数
+# 画像取得（HTTP）のタイムアウト秒数
 HTTP_TIMEOUT_SEC = 15
-
-# Mermaid図形をPNG化するAPI（Krokiが応答しない場合はmermaid.inkにフォールバック）
-KROKI_MERMAID_PNG_URL = "https://kroki.io/mermaid/png/"
-MERMAID_INK_URL = "https://mermaid.ink/img/"
 
 def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     """見出しタグの処理とスライド作成"""
@@ -228,22 +223,6 @@ def process_table(generator: PPTXGenerator, tag: Tag) -> None:
                 add_runs_from_tag(generator, col, p, font_conf)
     generator.slide_has_text = True
 
-def render_mermaid(text: str) -> requests.Response:
-    """Mermaid記法をPNG画像に変換する（Kroki優先、失敗時はmermaid.inkにフォールバック）"""
-    compressed = zlib.compress(text.encode('utf-8'), 9)
-    encoded = base64.urlsafe_b64encode(compressed).decode('ascii')
-
-    try:
-        response = requests.get(f"{KROKI_MERMAID_PNG_URL}{encoded}", timeout=HTTP_TIMEOUT_SEC)
-        response.raise_for_status()
-    except Exception as e_kroki:
-        print(f"INFO: Kroki APIが応答しませんでした。代替API(mermaid.ink)を試行します... ({e_kroki})")
-        encoded_ink = base64.urlsafe_b64encode(text.encode('utf-8')).decode('ascii')
-        response = requests.get(f"{MERMAID_INK_URL}{encoded_ink}", timeout=HTTP_TIMEOUT_SEC)
-        response.raise_for_status()
-
-    return response
-
 def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
     """コードブロックまたはMermaid図形の処理"""
     code_tag = tag.find('code')
@@ -261,14 +240,16 @@ def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
 
     if is_mermaid and isinstance(code_tag, Tag):
         try:
-            print("INFO: Mermaid図形をAPIで生成中...")
-            response = render_mermaid(code_tag.get_text())
+            print("INFO: Mermaid図形を生成中...")
+            image = render_mermaid(mermaid_conf(generator), code_tag.get_text())
+            if image is None:  # renderer: off
+                return
 
             if generator.slide_has_text:
                 shrink_body_shape(generator, width_inches=4.8)
-                place_image(generator, BytesIO(response.content), Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
+                place_image(generator, BytesIO(image), Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))
             else:
-                place_image(generator, BytesIO(response.content), Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
+                place_image(generator, BytesIO(image), Inches(1.0), Inches(1.5), Inches(8.0), Inches(3.8))
         except Exception as e:
             print(f"Warning: Mermaid図形の生成に失敗しました: {e}")
     else:

@@ -10,7 +10,7 @@ Markdownファイルから美しいPowerPoint（.pptx）スライドを自動生
   * 画像はスライドからはみ出さないよう、アスペクト比を維持して自動リサイズ・中央配置されます。
 * **エンジニア向け記法の完全サポート**
   * **インライン装飾・コードブロック:** 等幅フォントやシンタックスカラーを適用[cite: 2]。
-  * **Mermaid図形の自動生成:** ````mermaid ```` ブロックを自動的にPNG画像に変換してスライドに挿入（[Kroki API](https://kroki.io/)を使用）[cite: 3]。
+  * **Mermaid図形の自動生成:** ````mermaid ```` ブロックを自動的にPNG画像に変換してスライドに挿入[cite: 3]。[Kroki API](https://kroki.io/)（自己ホスト可）またはローカルの mermaid-cli を選択できます。
   * **ネイティブTable生成:** Markdownの表をPowerPointのネイティブな表オブジェクトに変換[cite: 2]。
 * **スピーカーノート対応**
   * 引用ブロック（`> `）で書かれたテキストは、スライド本文ではなく「ノート」領域に書き込まれます[cite: 2, 3]。
@@ -59,9 +59,9 @@ pytest
 ### 3. カバレッジ（網羅率）の計測
 コードの何割がテストされているかを確認し、レポートを表示します。
 ```bash
-pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov-report=term-missing
+pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov=mermaid_renderer --cov-report=term-missing
 ```
-現在のカバレッジは **99%**（143テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得はすべてモック化しているため、テスト実行時にネットワーク接続は不要です。
+現在のカバレッジは **99%**（167テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
 
 ### 4. 型チェック（mypy）
 全モジュールに型アノテーションを付与しています。設定は `mypy.ini` にあります。
@@ -129,6 +129,33 @@ graph TD
     B --> C[PowerPoint]
 ```
 
+#### ⚠️ 図の送信先について（機密情報の取り扱い）
+既定の `renderer: kroki` は、**図のソースを外部の公開サービス（kroki.io）へ送信**して画像化します。
+システム構成図やデータフローなど社外に出せない情報を扱う場合は、`config.yaml` で送信先を変更してください。
+
+```yaml
+mermaid:
+  renderer: "kroki"            # kroki | local | off
+  endpoint: "https://kroki.io" # 自己ホストしたKrokiのURLを指定できます
+  warn_on_external: true       # 公開サービスへ送信する際に警告を表示
+```
+
+| 設定 | 動作 | 外部送信 |
+| :--- | :--- | :--- |
+| `renderer: kroki`（既定） | Kroki で画像化 | **あり**（`endpoint` が公開サービスの場合） |
+| `renderer: kroki` + 自己ホスト `endpoint` | 社内のKrokiで画像化 | なし |
+| `renderer: local` | mermaid-cli でオフライン生成 | なし |
+| `renderer: off` | 図を生成しない | なし |
+
+**フォールバックの挙動:** Kroki が応答しない場合、公開API（mermaid.ink）への切り替えは
+**公開エンドポイントを使用している場合のみ**行われます。自己ホストの `endpoint` を指定している場合、
+障害時に図が外部へ送信されることはありません（`fallback_to_public: true` で明示的に許可しない限り）。
+
+**オフライン生成（`renderer: local`）を使う場合**は mermaid-cli が必要です。
+```bash
+npm install -g @mermaid-js/mermaid-cli
+```
+
 ## ⚙️ 設定ファイル (`config.yaml`)
 
 `config.yaml` では、スライドの画角（16:9等）や各要素のフォントスタイルを定義します。
@@ -157,4 +184,4 @@ fonts:
 ```
 
 ## ⚠️ 制限事項
-* Mermaid図形の変換には外部API（Kroki および mermaid.ink）を使用しているため、ネットワーク通信が発生します。
+* Mermaid図形の変換は、既定では外部API（Kroki）を使用するためネットワーク通信が発生します。オフライン生成や自己ホストへの切り替えは「[図の送信先について](#️-図の送信先について機密情報の取り扱い)」を参照してください。

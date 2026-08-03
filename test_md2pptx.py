@@ -9,6 +9,7 @@
 
 import base64
 import os
+import subprocess
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
@@ -21,9 +22,11 @@ from pptx.dml.color import RGBColor
 from pptx.util import Inches, Pt
 
 import md2pptx
+import mermaid_renderer
 import processors
 import utils
 from generator import PPTXGenerator
+from mermaid_renderer import MermaidRenderError, mermaid_conf, render_mermaid
 from md2pptx import apply_theme, load_config, main, parse_args, read_text_file
 from processors import (
     process_blockquote,
@@ -858,8 +861,8 @@ class TestProcessCodeOrMermaid:
         md = "```mermaid\ngraph TD; A-->B;\n```"
         process_code_or_mermaid(gen_with_slide, parse_md(md).find("pre"))
 
-        assert mock_get.call_args[0][0].startswith(processors.KROKI_MERMAID_PNG_URL)
-        assert mock_get.call_args[1]["timeout"] == processors.HTTP_TIMEOUT_SEC
+        assert mock_get.call_args[0][0].startswith(mermaid_renderer.DEFAULT_KROKI_ENDPOINT)
+        assert mock_get.call_args[1]["timeout"] == mermaid_renderer.HTTP_TIMEOUT_SEC
         mock_fit.assert_called_once()
 
     @patch("processors.insert_image_fit")
@@ -885,9 +888,21 @@ class TestProcessCodeOrMermaid:
         )
 
         assert mock_get.call_count == 2
-        assert mock_get.call_args[0][0].startswith(processors.MERMAID_INK_URL)
+        assert mock_get.call_args[0][0].startswith(mermaid_renderer.MERMAID_INK_URL)
         assert "代替API" in capsys.readouterr().out
         mock_fit.assert_called_once()
+
+    @patch("processors.place_image")
+    def test_renderer_off_places_nothing(self, mock_place, base_config, capsys):
+        """mermaid.renderer が off の場合、図を配置せずスライドはそのまま進む"""
+        base_config["mermaid"] = {"renderer": "off"}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        process_code_or_mermaid(gen, parse_md("```mermaid\ngraph TD; A-->B;\n```").find("pre"))
+
+        mock_place.assert_not_called()
+        assert "スキップ" in capsys.readouterr().out
 
     @patch("requests.get", side_effect=OSError("timeout"))
     def test_both_apis_failing_is_reported(self, _mock_get, gen_with_slide, capsys):
@@ -939,6 +954,207 @@ class TestProcessText:
 
         process_text(gen, parse_md("* 項目").find("li"))
         assert gen.current_body.paragraphs[0].runs[0].font.size == Pt(18)
+
+
+# =====================================================================
+# mermaid_renderer.py
+# =====================================================================
+
+
+class TestMermaidConfig:
+    def test_conf_is_read_from_config(self, base_config):
+        """config.yaml の mermaid セクションを読み取る"""
+        base_config["mermaid"] = {"renderer": "off"}
+        assert mermaid_conf(PPTXGenerator(base_config)) == {"renderer": "off"}
+
+    def test_missing_section_is_empty(self, gen):
+        """mermaid セクションが無い場合は空の設定になる"""
+        assert mermaid_conf(gen) == {}
+
+    @pytest.mark.parametrize(
+        "endpoint, expected",
+        [
+            ("https://kroki.io", True),
+            ("https://mermaid.ink/img/", True),
+            ("http://kroki.internal.example.com", False),
+            ("http://localhost:8000", False),
+        ],
+    )
+    def test_public_endpoint_detection(self, endpoint, expected):
+        """公開サービスかどうかを判定できる（警告とフォールバック可否の基準）"""
+        assert mermaid_renderer.is_public_endpoint(endpoint) is expected
+
+
+class TestRenderMermaid:
+    MMD = "graph TD; A-->B;"
+
+    def test_off_skips_generation(self, capsys):
+        """renderer: off では図を生成せず None を返す"""
+        assert render_mermaid({"renderer": "off"}, self.MMD) is None
+        assert "スキップ" in capsys.readouterr().out
+
+    def test_unknown_renderer_raises(self):
+        """未知のレンダラー名はエラーにする（設定ミスを黙って無視しない）"""
+        with pytest.raises(MermaidRenderError, match="未知の mermaid.renderer"):
+            render_mermaid({"renderer": "magic"}, self.MMD)
+
+    @patch("requests.get")
+    def test_default_uses_public_kroki(self, mock_get, mock_response):
+        """既定では公開Krokiを使う（従来どおりの動作）"""
+        mock_get.return_value = mock_response
+        assert render_mermaid({}, self.MMD) == TINY_PNG
+
+        url = mock_get.call_args[0][0]
+        assert url.startswith(f"{mermaid_renderer.DEFAULT_KROKI_ENDPOINT}/mermaid/png/")
+        assert mock_get.call_args[1]["timeout"] == mermaid_renderer.HTTP_TIMEOUT_SEC
+
+    @patch("requests.get")
+    def test_warns_before_sending_to_public_service(self, mock_get, mock_response, capsys):
+        """公開サービスへ送信する前に警告を表示する"""
+        mock_get.return_value = mock_response
+        render_mermaid({}, self.MMD)
+
+        out = capsys.readouterr().out
+        assert "外部サービス" in out
+        assert "kroki.io" in out
+
+    @patch("requests.get")
+    def test_warning_can_be_disabled(self, mock_get, mock_response, capsys):
+        """警告は warn_on_external: false で抑制できる"""
+        mock_get.return_value = mock_response
+        render_mermaid({"warn_on_external": False}, self.MMD)
+        assert "外部サービス" not in capsys.readouterr().out
+
+    @patch("requests.get")
+    def test_self_hosted_endpoint_is_used(self, mock_get, mock_response, capsys):
+        """自己ホストのKrokiを指定でき、その場合は警告を出さない"""
+        mock_get.return_value = mock_response
+        render_mermaid({"endpoint": "http://kroki.internal/"}, self.MMD)
+
+        assert mock_get.call_args[0][0].startswith("http://kroki.internal/mermaid/png/")
+        assert "外部サービス" not in capsys.readouterr().out
+
+    @patch("requests.get")
+    def test_public_endpoint_falls_back_to_mermaid_ink(self, mock_get, mock_response):
+        """公開Kroki利用時は従来どおり mermaid.ink にフォールバックする"""
+        mock_get.side_effect = [OSError("kroki down"), mock_response]
+
+        assert render_mermaid({}, self.MMD) == TINY_PNG
+        assert mock_get.call_args[0][0].startswith(mermaid_renderer.MERMAID_INK_URL)
+
+    @patch("requests.get")
+    def test_self_hosted_never_falls_back_to_public(self, mock_get):
+        """自己ホスト指定時は公開APIへフォールバックしない（情報漏洩の防止）
+
+        社内Krokiが落ちた際に、機密を含み得る図が公開サービスへ送られるのを防ぐ。
+        """
+        mock_get.side_effect = OSError("社内Krokiが停止")
+
+        with pytest.raises(MermaidRenderError, match="情報漏洩"):
+            render_mermaid({"endpoint": "http://kroki.internal"}, self.MMD)
+
+        assert mock_get.call_count == 1  # mermaid.ink は呼ばれない
+
+    @patch("requests.get")
+    def test_fallback_can_be_forced_for_self_hosted(self, mock_get, mock_response):
+        """明示的に許可した場合のみ、自己ホストでもフォールバックする"""
+        mock_get.side_effect = [OSError("down"), mock_response]
+
+        result = render_mermaid(
+            {"endpoint": "http://kroki.internal", "fallback_to_public": True}, self.MMD
+        )
+        assert result == TINY_PNG
+        assert mock_get.call_count == 2
+
+    @patch("requests.get")
+    def test_fallback_can_be_disabled_for_public(self, mock_get):
+        """公開Kroki利用時でもフォールバックを禁止できる"""
+        mock_get.side_effect = OSError("down")
+
+        with pytest.raises(MermaidRenderError):
+            render_mermaid({"fallback_to_public": False}, self.MMD)
+        assert mock_get.call_count == 1
+
+
+class TestLocalMermaidRendering:
+    """mermaid-cli によるオフライン生成（外部送信なし）"""
+
+    MMD = "graph TD; A-->B;"
+    CONF = {"renderer": "local"}
+
+    def _fake_run(self, png_bytes=TINY_PNG, returncode=0):
+        """mmdc の代わりに出力ファイルを書くダミー"""
+        def run(command, **kwargs):
+            if returncode == 0:
+                output_path = command[command.index("-o") + 1]
+                with open(output_path, "wb") as f:
+                    f.write(png_bytes)
+            stderr = "パースに失敗しました".encode("utf-8")
+            return subprocess.CompletedProcess(command, returncode, b"", stderr)
+        return run
+
+    def test_renders_without_network(self, mocker):
+        """ローカル生成ではネットワークを一切使わない"""
+        mocker.patch("subprocess.run", side_effect=self._fake_run())
+        mock_get = mocker.patch("requests.get")
+
+        assert render_mermaid(self.CONF, self.MMD) == TINY_PNG
+        mock_get.assert_not_called()
+
+    def test_diagram_source_is_passed_to_cli(self, mocker):
+        """図のソースを一時ファイル経由でCLIへ渡す"""
+        captured = {}
+
+        def run(command, **kwargs):
+            source_path = command[command.index("-i") + 1]
+            with open(source_path, encoding="utf-8") as f:
+                captured["source"] = f.read()
+            with open(command[command.index("-o") + 1], "wb") as f:
+                f.write(TINY_PNG)
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        mocker.patch("subprocess.run", side_effect=run)
+        render_mermaid(self.CONF, self.MMD)
+        assert captured["source"] == self.MMD
+
+    def test_custom_cli_path(self, mocker):
+        """cli_path で実行コマンドを差し替えられる"""
+        mock_run = mocker.patch("subprocess.run", side_effect=self._fake_run())
+        render_mermaid({"renderer": "local", "cli_path": "/opt/bin/mmdc"}, self.MMD)
+        assert mock_run.call_args[0][0][0] == "/opt/bin/mmdc"
+
+    def test_missing_cli_is_reported(self, mocker):
+        """mermaid-cli が未インストールの場合は導入方法を案内する"""
+        mocker.patch("subprocess.run", side_effect=FileNotFoundError)
+
+        with pytest.raises(MermaidRenderError, match="mermaid-cli"):
+            render_mermaid(self.CONF, self.MMD)
+
+    def test_cli_failure_is_reported(self, mocker):
+        """CLIが異常終了した場合は標準エラー出力を添えて報告する"""
+        mocker.patch("subprocess.run", side_effect=self._fake_run(returncode=1))
+
+        with pytest.raises(MermaidRenderError, match="失敗しました"):
+            render_mermaid(self.CONF, self.MMD)
+
+    def test_timeout_is_reported(self, mocker):
+        """タイムアウトした場合も分かるメッセージにする"""
+        mocker.patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired("mmdc", 60)
+        )
+
+        with pytest.raises(MermaidRenderError, match="タイムアウト"):
+            render_mermaid(self.CONF, self.MMD)
+
+    def test_missing_output_is_reported(self, mocker):
+        """CLIが正常終了しても画像が無い場合はエラーにする"""
+        mocker.patch(
+            "subprocess.run",
+            return_value=subprocess.CompletedProcess(["mmdc"], 0, b"", b""),
+        )
+
+        with pytest.raises(MermaidRenderError, match="画像を出力しませんでした"):
+            render_mermaid(self.CONF, self.MMD)
 
 
 # =====================================================================
