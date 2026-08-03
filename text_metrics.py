@@ -30,6 +30,14 @@ DEFAULT_FONT_SIZE_PT = 18.0
 #: 行送りの既定倍率
 DEFAULT_LINE_SPACING = 1.0
 
+#: 1行が占める高さの、フォントサイズに対する比率
+#
+# PowerPoint の行の高さはフォントサイズそのものではなく、フォントが持つ
+# 行高（ascent + descent + line gap）に基づく。本ツールが主に使う和文フォント
+# （Meiryo / Yu Gothic 等）はこれが約 1.3em あるため、フォントサイズと同一と
+# みなすと 3 割ほど過小評価になる。
+LINE_HEIGHT_RATIO = 1.3
+
 #: 縮小率の下限（これ以上小さくすると読めなくなるため）
 MIN_SHRINK_SCALE = 0.6
 
@@ -48,6 +56,7 @@ class ParagraphMetrics:
     level: int = 0
     line_spacing: float = DEFAULT_LINE_SPACING
     space_after_pt: float = 0.0
+    space_before_pt: float = 0.0
 
 
 def char_width_ratio(ch: str) -> float:
@@ -82,8 +91,8 @@ def estimate_height_pt(
         width = max(available_width_pt - indent, font_size)
 
         lines = estimate_line_count(paragraph.text, font_size, width)
-        total += lines * font_size * paragraph.line_spacing
-        total += paragraph.space_after_pt * scale
+        total += lines * font_size * LINE_HEIGHT_RATIO * paragraph.line_spacing
+        total += (paragraph.space_before_pt + paragraph.space_after_pt) * scale
     return total
 
 

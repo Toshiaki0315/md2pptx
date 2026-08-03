@@ -309,6 +309,7 @@ def _paragraph_metrics(paragraph: _Paragraph) -> ParagraphMetrics:
         level=paragraph.level,
         line_spacing=line_spacing,
         space_after_pt=paragraph.space_after.pt if paragraph.space_after else 0.0,
+        space_before_pt=paragraph.space_before.pt if paragraph.space_before else 0.0,
     )
 
 
@@ -336,8 +337,13 @@ def auto_shrink_text(slide: Slide | None) -> None:
         if scale >= 1.0: return
 
         for p in paragraphs:
+            if p.space_before:
+                p.space_before = Pt(p.space_before.pt * scale)
             if p.space_after:
                 p.space_after = Pt(p.space_after.pt * scale)
+            # 段落レベルのサイズ（process_h3 が設定する基準値）も併せて縮める
+            if p.font.size:
+                p.font.size = Pt(int(p.font.size.pt * scale))
             for run in p.runs:
                 if run.font.size:
                     run.font.size = Pt(int(run.font.size.pt * scale))
