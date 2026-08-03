@@ -25,3 +25,5 @@ htmlcov/
 coverage.xml
 nosetests.xml
 # ------------------------------------
+
+TASK.md
