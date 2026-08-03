@@ -1,77 +1,938 @@
-import pytest
+"""md2pptx のユニットテスト・結合テスト
+
+モジュール構成に合わせて以下の単位でテストを分けている。
+  - utils.py      : 描画・レイアウトのヘルパー関数
+  - processors.py : Markdownの各タグに対応する処理
+  - generator.py  : プレゼンテーション全体の組み立て
+  - md2pptx.py    : CLI
+"""
+
+import base64
 import os
 from unittest.mock import MagicMock, patch
-from pptx.util import Inches
-from io import BytesIO
+
+import markdown
+import pytest
+from bs4 import BeautifulSoup
+from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.util import Inches, Pt
+
+import md2pptx
+import processors
 from generator import PPTXGenerator
-from utils import insert_image_fit
+from md2pptx import apply_theme, load_config, main, parse_args, read_text_file
+from processors import (
+    process_blockquote,
+    process_code_or_mermaid,
+    process_h3,
+    process_heading,
+    process_hr,
+    process_image,
+    process_table,
+    process_text,
+)
+from utils import (
+    add_runs_from_tag,
+    append_code_textbox,
+    append_text_block,
+    apply_font_style,
+    auto_shrink_text,
+    hex_to_rgb,
+    insert_image_fit,
+    shrink_body_shape,
+)
+
+# 1x1ピクセルの最小PNG（画像挿入テスト用のダミーデータ）
+TINY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAE"
+    "hQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
 
 # --- フィクスチャ（テスト用の共通設定） ---
+
+
 @pytest.fixture
 def base_config():
     """テスト用の基本的なYAML設定のモック"""
     return {
-        "slides": {
-            "layout": "16:9"
-        },
+        "slides": {"layout": "16:9", "show_slide_number": False},
         "fonts": {
             "title_h1": {"name": "Meiryo", "size_pt": 44, "bold": True},
             "body": {"name": "Meiryo", "size_pt": 20},
-            "inline_code": {"name": "Consolas", "color_rgb": [220, 20, 60]}
+            "inline_code": {"name": "Consolas", "color_rgb": [220, 20, 60]},
         },
-        "images": {
-            "default_height_inches": 3.5
-        }
+        "images": {"default_height_inches": 3.5},
     }
 
-# --- テストケース ---
 
-def test_get_slide_size(base_config):
-    """スライドサイズの計算ロジックのテスト"""
-    gen = PPTXGenerator(base_config)
-    w, h = gen._get_slide_size("4:3")
-    assert w == Inches(10)
-    assert h == Inches(7.5)
-    
-    # 未知のフォーマットの場合はデフォルト(16:9)が返るか
-    w_def, h_def = gen._get_slide_size("unknown")
-    assert w_def == Inches(10)
-    assert h_def == Inches(5.625)
+@pytest.fixture
+def gen(base_config):
+    """スライド未作成のジェネレーター"""
+    return PPTXGenerator(base_config)
 
-def test_insert_image_fit():
-    """画像のリサイズとセンタリング計算のテスト"""
-    mock_slide = MagicMock()
-    mock_pic = MagicMock()
-    # 仮の元画像サイズ (横100, 縦200)
-    mock_pic.width = 100
-    mock_pic.height = 200
-    mock_slide.shapes.add_picture.return_value = mock_pic
 
-    # 枠を (横500, 縦500) に設定してリサイズ実行
-    pic = insert_image_fit(mock_slide, b"dummy_data", 0, 0, 500, 500)
+@pytest.fixture
+def gen_with_slide(gen):
+    """コンテンツスライドを1枚作成済みのジェネレーター"""
+    process_heading(gen, parse_md("## 見出し").find("h2"))
+    return gen
 
-    # ロジック内で最大1.5倍に制限(キャップ)されているため、1.5倍になる。
-    assert pic.width == 150
-    assert pic.height == 300
 
-@patch('processors.insert_image_fit')
-@patch('requests.get')
-def test_markdown_integration(mock_get, mock_insert_image, base_config, tmp_path):
-    """Markdownのパースからスライド生成までの一連の結合テスト"""
-    
-    # 外部API通信（requests.get）をモック化して通信をバイパス
-    mock_response = MagicMock()
-    mock_response.content = b"dummy_image_data"
-    mock_response.status_code = 200
-    mock_response.raise_for_status.return_value = None
-    mock_get.return_value = mock_response
+@pytest.fixture
+def png_file(tmp_path):
+    """ローカル画像ファイルのパス"""
+    path = tmp_path / "tiny.png"
+    path.write_bytes(TINY_PNG)
+    return str(path)
 
-    # テスト用の網羅的なMarkdown文字列
-    md_content = """
+
+@pytest.fixture
+def mock_response():
+    """requests.get の戻り値のモック"""
+    response = MagicMock()
+    response.content = TINY_PNG
+    response.status_code = 200
+    response.raise_for_status.return_value = None
+    return response
+
+
+def parse_md(md_text):
+    """Markdown文字列をBeautifulSoupに変換するヘルパー"""
+    html = markdown.markdown(md_text, extensions=["extra", "fenced_code", "sane_lists"])
+    return BeautifulSoup(html, "html.parser")
+
+
+def parse_html(html):
+    """HTML文字列をBeautifulSoupに変換するヘルパー"""
+    return BeautifulSoup(html, "html.parser")
+
+
+def new_paragraph():
+    """スタイル検証用の実物のparagraphオブジェクトを作る"""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    return box.text_frame.paragraphs[0]
+
+
+def textboxes_of(slide):
+    """スライド上のテキストボックス（プレースホルダー以外）を返す"""
+    return [s for s in slide.shapes if s.has_text_frame and not s.is_placeholder]
+
+
+# =====================================================================
+# utils.py
+# =====================================================================
+
+
+class TestHexToRgb:
+    @pytest.mark.parametrize("value", ["#ff8000", "ff8000"])
+    def test_parses_with_and_without_hash(self, value):
+        """先頭の # の有無にかかわらず解釈できる"""
+        assert hex_to_rgb(value) == RGBColor(255, 128, 0)
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_empty_returns_none(self, value):
+        """空の入力は None を返す"""
+        assert hex_to_rgb(value) is None
+
+
+class TestApplyFontStyle:
+    def test_all_properties_applied(self):
+        """name / size_pt / bold / color_rgb がすべて反映される"""
+        run = new_paragraph().add_run()
+        apply_font_style(
+            run, {"name": "Meiryo", "size_pt": 24, "bold": True, "color_rgb": [1, 2, 3]}
+        )
+        assert run.font.name == "Meiryo"
+        assert run.font.size == Pt(24)
+        assert run.font.bold is True
+        assert run.font.color.rgb == RGBColor(1, 2, 3)
+
+    def test_partial_config_leaves_others_untouched(self):
+        """指定されていないプロパティは変更されない"""
+        run = new_paragraph().add_run()
+        apply_font_style(run, {"name": "Meiryo"})
+        assert run.font.name == "Meiryo"
+        assert run.font.size is None
+        assert run.font.bold is None
+
+    @pytest.mark.parametrize("config", [None, {}])
+    def test_empty_config_is_noop(self, config):
+        """設定が空の場合は何も適用しない"""
+        run = new_paragraph().add_run()
+        apply_font_style(run, config)
+        assert run.font.name is None
+
+
+class TestInsertImageFit:
+    def _mock_slide(self, width, height):
+        mock_slide = MagicMock()
+        mock_pic = MagicMock()
+        mock_pic.width, mock_pic.height = width, height
+        mock_slide.shapes.add_picture.return_value = mock_pic
+        return mock_slide
+
+    def test_small_image_is_scaled_up_to_cap(self):
+        """小さい画像は最大1.5倍までしか拡大されない"""
+        pic = insert_image_fit(self._mock_slide(100, 200), b"dummy", 0, 0, 500, 500)
+        assert (pic.width, pic.height) == (150, 300)
+
+    def test_large_image_is_shrunk_to_fit(self):
+        """大きい画像はアスペクト比を保って枠内に縮小される"""
+        pic = insert_image_fit(self._mock_slide(1000, 500), b"dummy", 0, 0, 500, 500)
+        assert (pic.width, pic.height) == (500, 250)
+
+    def test_image_is_centered_in_frame(self):
+        """縮小後の画像は枠の中央に配置される"""
+        pic = insert_image_fit(self._mock_slide(1000, 500), b"dummy", 100, 200, 500, 500)
+        assert pic.left == 100
+        assert pic.top == 200 + (500 - 250) / 2
+
+
+class TestAddRunsFromTag:
+    def _runs_for(self, gen, html):
+        p = new_paragraph()
+        add_runs_from_tag(gen, parse_html(html).p, p, {"name": "Meiryo"})
+        return p.runs
+
+    def test_bold_and_italic(self, gen):
+        """strong/em がフォントスタイルに変換される"""
+        runs = self._runs_for(gen, "<p><strong>太字</strong><em>斜体</em></p>")
+        assert [r.text for r in runs] == ["太字", "斜体"]
+        assert runs[0].font.bold is True
+        assert runs[1].font.italic is True
+
+    def test_inline_code_uses_code_font(self, gen):
+        """codeタグにはinline_codeの設定が適用される"""
+        (run,) = self._runs_for(gen, "<p><code>x = 1</code></p>")
+        assert run.font.name == "Consolas"
+        assert run.font.color.rgb == RGBColor(220, 20, 60)
+
+    def test_inline_code_falls_back_to_defaults(self, base_config):
+        """inline_code が未設定でも既定の等幅フォント・色になる"""
+        base_config["fonts"].pop("inline_code")
+        gen = PPTXGenerator(base_config)
+        (run,) = self._runs_for(gen, "<p><code>x</code></p>")
+        assert run.font.name == "Consolas"
+        assert run.font.color.rgb == RGBColor(220, 20, 60)
+
+    def test_plain_text_uses_default_font(self, gen):
+        """装飾の無いテキストには既定フォントが適用される"""
+        (run,) = self._runs_for(gen, "<p>ふつうの文字</p>")
+        assert run.font.name == "Meiryo"
+
+    def test_nested_container_is_flattened(self, gen):
+        """spanなどのコンテナ要素は再帰的に展開される"""
+        runs = self._runs_for(gen, "<p><span>外<strong>中</strong></span></p>")
+        assert [r.text for r in runs] == ["外", "中"]
+        assert runs[1].font.bold is True
+
+    def test_block_tags_are_skipped(self, gen):
+        """リストや表などのブロック要素はインライン処理から除外される"""
+        runs = self._runs_for(gen, "<p>本文<ul><li>項目</li></ul><table></table></p>")
+        assert [r.text for r in runs] == ["本文"]
+
+    def test_newlines_are_replaced(self, gen):
+        """改行は半角スペースに置換される"""
+        runs = self._runs_for(gen, "<p>1行目\n2行目</p>")
+        assert runs[0].text == "1行目 2行目"
+
+
+class TestShrinkBodyShape:
+    def test_width_is_applied(self, gen_with_slide):
+        """指定した幅が本文枠に反映される"""
+        shrink_body_shape(gen_with_slide, width_inches=4.8)
+        assert gen_with_slide.current_slide.placeholders[1].width == Inches(4.8)
+
+    def test_inherited_geometry_is_kept(self, gen_with_slide):
+        """幅だけを変えてもレイアウトから継承した位置・高さが失われない
+
+        プレースホルダーの寸法は継承値のため、一部だけ書き換えると残りが0になる。
+        shrink_body_shape 内の left/top 自己代入が効いていることの回帰テスト。
+        """
+        shape = gen_with_slide.current_slide.placeholders[1]
+        top, height = shape.top, shape.height
+
+        shrink_body_shape(gen_with_slide, width_inches=4.8)
+
+        assert shape.left > 0
+        assert (shape.top, shape.height) == (top, height)
+
+    def test_max_height_is_applied(self, gen_with_slide):
+        """max_height_inches を渡すと高さも縮む"""
+        shrink_body_shape(gen_with_slide, width_inches=8.0, max_height_inches=2.0)
+        assert gen_with_slide.current_slide.placeholders[1].height == Inches(2.0)
+
+    def test_without_slide_is_noop(self, gen):
+        """スライド未作成でも例外にならない"""
+        shrink_body_shape(gen, width_inches=4.8)
+
+
+class TestAppendTextBlock:
+    def test_first_paragraph_is_reused_then_appended(self, gen_with_slide):
+        """最初の段落は空の既存段落を再利用し、以降は追加される"""
+        append_text_block(gen_with_slide, parse_md("1つ目").find("p"))
+        assert len(gen_with_slide.current_body.paragraphs) == 1
+
+        gen_with_slide.slide_has_text = True
+        append_text_block(gen_with_slide, parse_md("2つ目").find("p"))
+        assert len(gen_with_slide.current_body.paragraphs) == 2
+
+    def test_level_and_spacing(self, gen_with_slide):
+        """レベルと行間・段落後余白が設定される"""
+        append_text_block(gen_with_slide, parse_md("* 項目").find("li"), level=2)
+        p = gen_with_slide.current_body.paragraphs[0]
+        assert p.level == 2
+        assert p.space_after == Pt(12)
+        assert p.line_spacing == 1.2
+
+
+class TestAppendCodeTextbox:
+    def test_creates_textbox_with_background(self, gen_with_slide):
+        """コードは背景色付きの独立したテキストボックスに描画される"""
+        append_code_textbox(gen_with_slide, "print(1)", language="python")
+
+        boxes = textboxes_of(gen_with_slide.current_slide)
+        assert len(boxes) == 1
+        assert boxes[0].fill.fore_color.rgb == RGBColor(40, 44, 52)
+        assert gen_with_slide.slide_has_text is True
+
+    def test_background_color_from_theme(self, base_config):
+        """theme.code_bg_color で背景色を変更できる"""
+        base_config["theme"] = {"code_bg_color": [1, 2, 3]}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        append_code_textbox(gen, "print(1)", language="python")
+        assert textboxes_of(gen.current_slide)[0].fill.fore_color.rgb == RGBColor(1, 2, 3)
+
+    def test_syntax_highlight_splits_runs(self, gen_with_slide):
+        """シンタックスハイライトによりトークンごとにrunが分割される"""
+        append_code_textbox(gen_with_slide, "def f():\n    return 1\n", language="python")
+
+        runs = textboxes_of(gen_with_slide.current_slide)[0].text_frame.paragraphs[0].runs
+        assert len(runs) > 1
+        assert "".join(r.text for r in runs) == "def f():\n    return 1\n"
+        assert all(r.font.color.rgb is not None for r in runs)
+
+    def test_unknown_language_falls_back_to_plain(self, gen_with_slide):
+        """未知の言語指定でも例外にせずプレーンテキストとして描画する"""
+        append_code_textbox(gen_with_slide, "hello", language="no_such_language")
+        runs = textboxes_of(gen_with_slide.current_slide)[0].text_frame.paragraphs[0].runs
+        # pygmentsは末尾に改行を補うため、内容の一致のみを確認する
+        assert "".join(r.text for r in runs).strip() == "hello"
+
+    def test_language_is_guessed_when_omitted(self, gen_with_slide):
+        """言語未指定でも推定してハイライトする"""
+        append_code_textbox(gen_with_slide, "def f():\n    return 1\n", language=None)
+        runs = textboxes_of(gen_with_slide.current_slide)[0].text_frame.paragraphs[0].runs
+        assert "".join(r.text for r in runs) == "def f():\n    return 1\n"
+
+    def test_two_column_layout_shrinks_body(self, gen_with_slide):
+        """テキストがある場合は本文枠を縮めて右側に配置する"""
+        gen_with_slide.slide_has_text = True
+        append_code_textbox(gen_with_slide, "x", language="python")
+
+        assert gen_with_slide.current_slide.placeholders[1].width == Inches(4.5)
+        assert textboxes_of(gen_with_slide.current_slide)[0].left == Inches(5.0)
+
+    def test_center_layout(self, gen_with_slide):
+        """forced_layout=center では中央寄せの枠になる"""
+        gen_with_slide.forced_layout = "center"
+        append_code_textbox(gen_with_slide, "x", language="python")
+        assert textboxes_of(gen_with_slide.current_slide)[0].left == Inches(1.5)
+
+    def test_default_layout(self, gen_with_slide):
+        """テキストが無い場合はスライド幅いっぱいに配置する"""
+        append_code_textbox(gen_with_slide, "x", language="python")
+        box = textboxes_of(gen_with_slide.current_slide)[0]
+        assert (box.left, box.width) == (Inches(1.0), Inches(8.0))
+
+
+class TestAutoShrinkText:
+    def _fill_body(self, gen, line_count):
+        for i in range(line_count):
+            gen.slide_has_text = i > 0
+            append_text_block(gen, parse_md(f"行{i}").find("p"), font_conf={"size_pt": 20})
+
+    def test_shrinks_when_too_many_lines(self, gen_with_slide):
+        """行数が閾値を超えるとフォントサイズが縮小される"""
+        self._fill_body(gen_with_slide, 12)
+        auto_shrink_text(gen_with_slide.current_slide)
+
+        sizes = [
+            run.font.size for p in gen_with_slide.current_body.paragraphs for run in p.runs
+        ]
+        assert sizes and all(size < Pt(20) for size in sizes)
+
+    def test_keeps_size_when_few_lines(self, gen_with_slide):
+        """行数が少ない場合は縮小しない"""
+        self._fill_body(gen_with_slide, 3)
+        auto_shrink_text(gen_with_slide.current_slide)
+
+        sizes = [
+            run.font.size for p in gen_with_slide.current_body.paragraphs for run in p.runs
+        ]
+        assert sizes and all(size == Pt(20) for size in sizes)
+
+    def test_none_slide_is_noop(self):
+        """スライドが None でも例外にならない"""
+        auto_shrink_text(None)
+
+    def test_unexpected_slide_structure_is_ignored(self):
+        """想定外の構造のスライドを渡しても例外を投げない（縮小は best-effort）"""
+        broken = MagicMock()
+        broken.placeholders.__len__.side_effect = ValueError("broken")
+        auto_shrink_text(broken)
+
+    def test_slide_without_body_is_noop(self, gen):
+        """本文プレースホルダーが無いレイアウトでも例外にならない"""
+        blank = gen.prs.slides.add_slide(gen.prs.slide_layouts[6])
+        auto_shrink_text(blank)
+
+
+# =====================================================================
+# processors.py
+# =====================================================================
+
+
+class TestProcessHeading:
+    def test_h1_creates_title_slide(self, gen):
+        """h1はタイトルスライド（レイアウト0）を作る"""
+        process_heading(gen, parse_md("# タイトル").find("h1"))
+        assert len(gen.prs.slides) == 1
+        assert gen.current_slide.shapes.title.text == "タイトル"
+        assert gen.current_slide.slide_layout == gen.prs.slide_layouts[0]
+
+    def test_h2_creates_content_slide(self, gen):
+        """h2はコンテンツスライド（レイアウト1）を作る"""
+        process_heading(gen, parse_md("## 中身").find("h2"))
+        assert gen.current_slide.slide_layout == gen.prs.slide_layouts[1]
+
+    def test_title_font_is_applied(self, gen):
+        """title_h1 の設定がタイトルに適用される"""
+        process_heading(gen, parse_md("# タイトル").find("h1"))
+        run = gen.current_slide.shapes.title.text_frame.paragraphs[0].runs[0]
+        assert run.font.size == Pt(44)
+        assert run.font.bold is True
+
+    def test_generic_title_config_is_fallback(self, base_config):
+        """title_h2 が無い場合は title の設定にフォールバックする"""
+        base_config["fonts"]["title"] = {"size_pt": 18}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 中身").find("h2"))
+        run = gen.current_slide.shapes.title.text_frame.paragraphs[0].runs[0]
+        assert run.font.size == Pt(18)
+
+    def test_state_is_reset_for_new_slide(self, gen):
+        """スライド作成時に本文とテキスト有無フラグが初期化される"""
+        gen.slide_has_text = True
+        process_heading(gen, parse_md("## 中身").find("h2"))
+        assert gen.slide_has_text is False
+        assert gen.current_body.text == ""
+
+    def test_body_height_is_clamped_to_slide(self, gen):
+        """デフォルトテンプレートでは本文枠がスライド内に収まるよう補正される"""
+        process_heading(gen, parse_md("## 中身").find("h2"))
+        shape = gen.current_slide.placeholders[1]
+        assert shape.top + shape.height == gen.prs.slide_height - Inches(0.5)
+        assert shape.width > 0  # 継承値のリセット防止
+
+    def test_previous_slide_is_shrunk(self, gen):
+        """新しいスライドを作る前に直前のスライドの自動縮小が走る"""
+        process_heading(gen, parse_md("## 1枚目").find("h2"))
+        with patch("processors.auto_shrink_text") as mock_shrink:
+            process_heading(gen, parse_md("## 2枚目").find("h2"))
+        mock_shrink.assert_called_once()
+
+    def test_body_correction_failure_is_ignored(self, gen, mocker):
+        """本文枠の補正に失敗してもスライド生成は継続する"""
+        mocker.patch("processors.Inches", side_effect=ValueError("broken"))
+
+        process_heading(gen, parse_md("## 中身").find("h2"))
+        assert gen.current_slide.shapes.title.text == "中身"
+
+
+class TestProcessH3:
+    BU_NONE = "{http://schemas.openxmlformats.org/drawingml/2006/main}buNone"
+
+    def test_adds_subheading_paragraph(self, gen_with_slide):
+        """h3は本文内の小見出し段落として追加される"""
+        process_h3(gen_with_slide, parse_md("### 小見出し").find("h3"))
+
+        assert gen_with_slide.current_body.paragraphs[-1].runs[0].text == "小見出し"
+        assert gen_with_slide.slide_has_text is True
+
+    def test_bullet_is_disabled(self, gen_with_slide):
+        """箇条書き記号が無効化される（buNone要素が入る）"""
+        process_h3(gen_with_slide, parse_md("### 小見出し").find("h3"))
+
+        p_pr = gen_with_slide.current_body.paragraphs[-1]._element.get_or_add_pPr()
+        assert p_pr.find(self.BU_NONE) is not None
+
+    def test_font_config_is_applied(self, base_config):
+        """title_h3 の設定が適用される"""
+        base_config["fonts"]["title_h3"] = {"name": "Meiryo", "size_pt": 26, "bold": True}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        process_h3(gen, parse_md("### 小見出し").find("h3"))
+        p = gen.current_body.paragraphs[-1]
+        assert p.runs[0].font.size == Pt(26)
+        assert p.font.size == Pt(26)
+
+    def test_empty_heading_is_skipped(self, gen_with_slide):
+        """空のh3は段落を追加しない"""
+        before = len(gen_with_slide.current_body.paragraphs)
+        process_h3(gen_with_slide, parse_html("<h3>  </h3>").h3)
+        assert len(gen_with_slide.current_body.paragraphs) == before
+
+
+class TestProcessHr:
+    def test_creates_untitled_slide(self, gen_with_slide):
+        """水平線はタイトルの無い新しいスライドを作る"""
+        process_hr(gen_with_slide, parse_md("---").find("hr"))
+
+        assert len(gen_with_slide.prs.slides) == 2
+        assert gen_with_slide.current_slide.shapes.title is None
+        assert gen_with_slide.slide_has_text is False
+
+    def test_body_uses_full_height(self, gen_with_slide):
+        """タイトルが無い分、本文枠を上部から広く使う"""
+        process_hr(gen_with_slide, parse_md("---").find("hr"))
+
+        shape = gen_with_slide.current_slide.placeholders[1]
+        assert shape.top == Inches(0.5)
+        assert shape.width > 0
+
+    def test_body_correction_failure_is_ignored(self, gen_with_slide, mocker):
+        """本文枠の補正に失敗してもスライド生成は継続する"""
+        mocker.patch("processors.Inches", side_effect=ValueError("broken"))
+
+        process_hr(gen_with_slide, parse_md("---").find("hr"))
+        assert len(gen_with_slide.prs.slides) == 2
+
+
+class TestProcessBlockquote:
+    def test_note_is_written(self, gen_with_slide):
+        """引用ブロックはスピーカーノートに書き込まれる"""
+        process_blockquote(gen_with_slide, parse_md("> メモ").find("blockquote"))
+        assert gen_with_slide.current_slide.notes_slide.notes_text_frame.text == "メモ"
+
+    def test_multiple_notes_are_appended(self, gen_with_slide):
+        """複数の引用ブロックは空行を挟んで追記される"""
+        process_blockquote(gen_with_slide, parse_md("> 1つ目").find("blockquote"))
+        process_blockquote(gen_with_slide, parse_md("> 2つ目").find("blockquote"))
+
+        notes = gen_with_slide.current_slide.notes_slide.notes_text_frame.text
+        assert notes == "1つ目\n\n2つ目"
+
+
+class TestProcessImage:
+    def test_local_path_is_inserted(self, gen_with_slide, png_file):
+        """ローカル画像はダウンロードせずにそのまま挿入される"""
+        process_image(gen_with_slide, parse_html(f'<img src="{png_file}">').img)
+        assert len(gen_with_slide.current_slide.shapes) == 3  # title, body, picture
+
+    @patch("requests.get")
+    def test_remote_image_is_downloaded_with_timeout(
+        self, mock_get, gen_with_slide, mock_response
+    ):
+        """URL画像はタイムアウト付きで取得される"""
+        mock_get.return_value = mock_response
+        process_image(gen_with_slide, parse_html('<img src="http://example.com/a.png">').img)
+
+        mock_get.assert_called_once_with(
+            "http://example.com/a.png", timeout=processors.HTTP_TIMEOUT_SEC
+        )
+        mock_response.raise_for_status.assert_called_once()
+
+    @patch("processors.insert_image_fit")
+    def test_fixed_position_from_config(self, mock_fit, base_config, png_file):
+        """position_inches が指定されている場合はオートレイアウトを使わない"""
+        base_config["images"]["position_inches"] = [5.2, 1.8]
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+        gen.current_slide = MagicMock()
+
+        process_image(gen, parse_html(f'<img src="{png_file}">').img)
+
+        mock_fit.assert_not_called()
+        gen.current_slide.shapes.add_picture.assert_called_once_with(
+            png_file, Inches(5.2), Inches(1.8), height=Inches(3.5)
+        )
+
+    @patch("processors.insert_image_fit")
+    def test_two_column_when_slide_has_text(self, mock_fit, gen_with_slide, png_file):
+        """テキストがあるスライドでは本文枠を縮めて右側に配置する"""
+        gen_with_slide.slide_has_text = True
+        process_image(gen_with_slide, parse_html(f'<img src="{png_file}">').img)
+
+        args = mock_fit.call_args[0]
+        assert (args[2], args[4]) == (Inches(5.2), Inches(4.5))
+        assert gen_with_slide.current_slide.placeholders[1].width == Inches(4.8)
+
+    @patch("processors.insert_image_fit")
+    def test_forced_two_column_layout(self, mock_fit, gen_with_slide, png_file):
+        """forced_layout=2-column ではテキストが無くても右側に配置する"""
+        gen_with_slide.forced_layout = "2-column"
+        process_image(gen_with_slide, parse_html(f'<img src="{png_file}">').img)
+        assert mock_fit.call_args[0][2] == Inches(5.2)
+
+    @patch("processors.insert_image_fit")
+    def test_forced_center_layout(self, mock_fit, gen_with_slide, png_file):
+        """forced_layout=center ではテキストの有無によらず中央に配置する"""
+        gen_with_slide.slide_has_text = True
+        gen_with_slide.forced_layout = "center"
+        process_image(gen_with_slide, parse_html(f'<img src="{png_file}">').img)
+
+        assert (mock_fit.call_args[0][2], mock_fit.call_args[0][4]) == (
+            Inches(1.0),
+            Inches(8.0),
+        )
+
+    def test_missing_src_is_skipped(self, gen_with_slide, capsys):
+        """src属性が無い画像は警告を出してスキップする"""
+        process_image(gen_with_slide, parse_html("<img>").img)
+
+        assert "Warning" in capsys.readouterr().out
+        assert len(gen_with_slide.current_slide.shapes) == 2
+
+    @patch("requests.get", side_effect=OSError("network down"))
+    def test_download_failure_is_reported(self, _mock_get, gen_with_slide, capsys):
+        """取得に失敗しても処理は継続し、警告のみ表示する"""
+        process_image(gen_with_slide, parse_html('<img src="https://example.com/a.png">').img)
+        assert "画像の挿入に失敗しました" in capsys.readouterr().out
+
+
+class TestProcessTable:
+    MD_TABLE = "| 列A | 列B |\n|---|---|\n| 値1 | 値2 |"
+
+    def _table_of(self, gen):
+        return [s for s in gen.current_slide.shapes if s.has_table][0].table
+
+    def test_rows_and_cells_are_converted(self, gen_with_slide):
+        """行数・列数とセルのテキストが再現される"""
+        process_table(gen_with_slide, parse_md(self.MD_TABLE).find("table"))
+        table = self._table_of(gen_with_slide)
+
+        assert (len(table.rows), len(table.columns)) == (2, 2)
+        assert table.cell(0, 0).text == "列A"
+        assert table.cell(1, 1).text == "値2"
+        assert gen_with_slide.slide_has_text is True
+
+    def test_header_style(self, gen_with_slide):
+        """ヘッダー行は太字・専用サイズ・背景色が付く"""
+        process_table(gen_with_slide, parse_md(self.MD_TABLE).find("table"))
+        table = self._table_of(gen_with_slide)
+
+        header = table.cell(0, 0)
+        assert header.text_frame.paragraphs[0].runs[0].font.bold is True
+        assert header.text_frame.paragraphs[0].runs[0].font.size == Pt(14)
+        assert header.fill.fore_color.rgb == RGBColor(31, 73, 125)
+        assert table.cell(1, 0).text_frame.paragraphs[0].runs[0].font.size == Pt(12)
+
+    def test_inline_decoration_in_cell(self, gen_with_slide):
+        """セル内の太字・インラインコードも反映される"""
+        process_table(gen_with_slide, parse_md("| 見出し |\n|---|\n| **強調** |").find("table"))
+        run = self._table_of(gen_with_slide).cell(1, 0).text_frame.paragraphs[0].runs[0]
+        assert run.font.bold is True
+
+    def test_column_count_uses_widest_row(self, gen_with_slide):
+        """列数が揃っていない場合は最大列数に合わせる"""
+        html = "<table><tr><td>a</td></tr><tr><td>b</td><td>c</td></tr></table>"
+        process_table(gen_with_slide, parse_html(html).table)
+        assert len(self._table_of(gen_with_slide).columns) == 2
+
+    def test_empty_table_is_skipped(self, gen_with_slide):
+        """行が無い表は何も生成しない"""
+        process_table(gen_with_slide, parse_html("<table></table>").table)
+        assert len(gen_with_slide.current_slide.shapes) == 2
+
+    def test_layout_is_split_when_slide_has_text(self, gen_with_slide):
+        """テキストがある場合は本文枠を縮めて表を下半分に置く"""
+        gen_with_slide.slide_has_text = True
+        process_table(gen_with_slide, parse_md(self.MD_TABLE).find("table"))
+
+        shape = [s for s in gen_with_slide.current_slide.shapes if s.has_table][0]
+        assert shape.top == Inches(2.8)
+        assert gen_with_slide.current_slide.placeholders[1].height == Inches(2.0)
+
+    def test_layout_is_full_when_slide_is_empty(self, gen_with_slide):
+        """テキストが無い場合は表を上部から配置する"""
+        process_table(gen_with_slide, parse_md(self.MD_TABLE).find("table"))
+        shape = [s for s in gen_with_slide.current_slide.shapes if s.has_table][0]
+        assert shape.top == Inches(1.5)
+
+
+class TestProcessCodeOrMermaid:
+    def test_code_block_without_language_does_not_crash(self, gen_with_slide):
+        """言語指定の無いコードブロックでも落ちない（class属性がNoneになるケース）
+
+        `code_tag.get('class')` は class 属性が無いと None を返すため、
+        そのまま `in` 演算子に渡すと TypeError になる回帰テスト。
+        """
+        pre = parse_md("```\nplain text\n```").find("pre")
+        assert pre.find("code").get("class") is None  # 前提条件の確認
+
+        process_code_or_mermaid(gen_with_slide, pre)
+
+        runs = textboxes_of(gen_with_slide.current_slide)[0].text_frame.paragraphs[0].runs
+        assert "plain text" in "".join(r.text for r in runs)
+
+    def test_language_is_extracted(self, gen_with_slide):
+        """language-xxx クラスから言語名が取り出される"""
+        with patch("processors.append_code_textbox") as mock_append:
+            process_code_or_mermaid(gen_with_slide, parse_md("```python\nx=1\n```").find("pre"))
+        assert mock_append.call_args[1]["language"] == "python"
+
+    def test_code_block_is_rendered(self, gen_with_slide):
+        """通常のコードブロックは背景色付きテキストボックスになる"""
+        process_code_or_mermaid(gen_with_slide, parse_md("```python\nprint(1)\n```").find("pre"))
+
+        assert len(textboxes_of(gen_with_slide.current_slide)) == 1
+        assert gen_with_slide.slide_has_text is True
+
+    @patch("processors.insert_image_fit")
+    @patch("requests.get")
+    def test_mermaid_is_rendered_as_image(
+        self, mock_get, mock_fit, gen_with_slide, mock_response
+    ):
+        """Mermaid記法は画像として挿入される"""
+        mock_get.return_value = mock_response
+        md = "```mermaid\ngraph TD; A-->B;\n```"
+        process_code_or_mermaid(gen_with_slide, parse_md(md).find("pre"))
+
+        assert mock_get.call_args[0][0].startswith(processors.KROKI_MERMAID_PNG_URL)
+        assert mock_get.call_args[1]["timeout"] == processors.HTTP_TIMEOUT_SEC
+        mock_fit.assert_called_once()
+
+    @patch("processors.insert_image_fit")
+    @patch("requests.get")
+    def test_mermaid_two_column_layout(self, mock_get, mock_fit, gen_with_slide, mock_response):
+        """テキストがあるスライドではMermaid図を右側に配置する"""
+        mock_get.return_value = mock_response
+        gen_with_slide.slide_has_text = True
+        process_code_or_mermaid(
+            gen_with_slide, parse_md("```mermaid\ngraph TD; A-->B;\n```").find("pre")
+        )
+        assert mock_fit.call_args[0][2] == Inches(5.2)
+
+    @patch("processors.insert_image_fit")
+    @patch("requests.get")
+    def test_falls_back_to_mermaid_ink(
+        self, mock_get, mock_fit, gen_with_slide, mock_response, capsys
+    ):
+        """Krokiが失敗した場合はmermaid.inkにフォールバックする"""
+        mock_get.side_effect = [OSError("kroki down"), mock_response]
+        process_code_or_mermaid(
+            gen_with_slide, parse_md("```mermaid\ngraph TD; A-->B;\n```").find("pre")
+        )
+
+        assert mock_get.call_count == 2
+        assert mock_get.call_args[0][0].startswith(processors.MERMAID_INK_URL)
+        assert "代替API" in capsys.readouterr().out
+        mock_fit.assert_called_once()
+
+    @patch("requests.get", side_effect=OSError("timeout"))
+    def test_both_apis_failing_is_reported(self, _mock_get, gen_with_slide, capsys):
+        """両方のAPIが失敗しても警告のみ表示して処理を継続する"""
+        process_code_or_mermaid(
+            gen_with_slide, parse_md("```mermaid\ngraph TD; A-->B;\n```").find("pre")
+        )
+        assert "Mermaid図形の生成に失敗しました" in capsys.readouterr().out
+
+
+class TestProcessText:
+    def test_paragraph_uses_body_font(self, gen_with_slide):
+        """段落にはbodyのフォント設定が適用される"""
+        process_text(gen_with_slide, parse_md("本文です").find("p"))
+
+        run = gen_with_slide.current_body.paragraphs[0].runs[0]
+        assert run.text == "本文です"
+        assert run.font.size == Pt(20)
+        assert gen_with_slide.slide_has_text is True
+
+    def test_empty_text_is_skipped(self, gen_with_slide):
+        """空の要素は段落を追加しない"""
+        process_text(gen_with_slide, parse_html("<p>   </p>").p)
+
+        assert gen_with_slide.slide_has_text is False
+        assert len(gen_with_slide.current_body.paragraphs) == 1
+
+    def test_bullet_level_follows_nesting(self, gen_with_slide):
+        """ネストの深さがリストのレベルになる"""
+        for item in parse_md("* 親\n    * 子\n        * 孫").find_all("li"):
+            process_text(gen_with_slide, item)
+
+        assert [p.level for p in gen_with_slide.current_body.paragraphs] == [0, 1, 2]
+
+    def test_bullet_level_is_capped(self, gen_with_slide):
+        """レベルはPowerPointの上限(8)でクランプされる"""
+        html = "<ul><li>深い</li></ul>"
+        for _ in range(12):
+            html = f"<ul><li>{html}</li></ul>"
+
+        process_text(gen_with_slide, parse_html(html).find_all("li")[-1])
+        assert gen_with_slide.current_body.paragraphs[0].level == 8
+
+    def test_bullet_level_font_config(self, base_config):
+        """bullet_level_N の設定がレベルごとに適用される"""
+        base_config["fonts"]["bullet_level_1"] = {"size_pt": 18}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        process_text(gen, parse_md("* 項目").find("li"))
+        assert gen.current_body.paragraphs[0].runs[0].font.size == Pt(18)
+
+
+# =====================================================================
+# generator.py
+# =====================================================================
+
+
+class TestInitialization:
+    @pytest.mark.parametrize(
+        "layout, expected",
+        [
+            ("16:9", (Inches(10), Inches(5.625))),
+            ("4:3", (Inches(10), Inches(7.5))),
+            ("16:10", (Inches(10), Inches(6.25))),
+            ("A4", (Inches(11.69), Inches(8.27))),
+            ("unknown", (Inches(10), Inches(5.625))),
+        ],
+    )
+    def test_get_slide_size(self, gen, layout, expected):
+        """スライドサイズの計算ロジック（未知の値は16:9にフォールバック）"""
+        assert gen._get_slide_size(layout) == expected
+
+    def test_slide_size_applied_from_config(self, base_config):
+        """config.yamlの画角がプレゼンテーションに反映される"""
+        base_config["slides"]["layout"] = "4:3"
+        gen = PPTXGenerator(base_config)
+        assert (gen.prs.slide_width, gen.prs.slide_height) == (Inches(10), Inches(7.5))
+
+    @pytest.mark.parametrize(
+        "config", [None, {}, {"slides": None, "fonts": None, "images": None}]
+    )
+    def test_empty_config_is_accepted(self, config):
+        """設定が空・Noneでも既定値で初期化できる"""
+        assert PPTXGenerator(config).prs.slide_height == Inches(5.625)
+
+    def test_template_is_loaded_when_exists(self, base_config, tmp_path):
+        """テンプレートが存在する場合は読み込み、画角設定を上書きしない"""
+        template = tmp_path / "template.pptx"
+        prs = Presentation()
+        prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+        prs.save(str(template))
+
+        base_config["slides"]["template_path"] = str(template)
+        assert PPTXGenerator(base_config).prs.slide_width == Inches(13.333)
+
+    def test_missing_template_falls_back_to_default(self, base_config):
+        """テンプレートのパスが不正な場合はデフォルトのプレゼンテーションを使う"""
+        base_config["slides"]["template_path"] = "no_such_template.pptx"
+        assert PPTXGenerator(base_config).prs.slide_height == Inches(5.625)
+
+
+class TestFrontMatter:
+    FM = (
+        '---\ntitle: "資料タイトル"\nsubtitle: "サブ"\n'
+        'author: "著者"\ndate: "2026-05-10"\n---\n\n## 中身\n本文\n'
+    )
+
+    def test_title_slide_is_generated(self, gen, tmp_path):
+        """フロントマターからタイトルスライドが自動生成される"""
+        gen.generate(self.FM, str(tmp_path / "out.pptx"))
+
+        title_slide = gen.prs.slides[0]
+        assert title_slide.shapes.title.text == "資料タイトル"
+        assert title_slide.placeholders[1].text == "サブ\n著者\n2026-05-10"
+        assert len(gen.prs.slides) == 2
+
+    def test_title_font_is_applied(self, gen, tmp_path):
+        """タイトルには title_h1 の設定が適用される"""
+        gen.generate(self.FM, str(tmp_path / "out.pptx"))
+        run = gen.prs.slides[0].shapes.title.text_frame.paragraphs[0].runs[0]
+        assert run.font.size == Pt(44)
+
+    def test_broken_front_matter_is_reported(self, gen, tmp_path, capsys):
+        """壊れたフロントマターは警告を出して処理を続行する"""
+        gen.generate("---\ntitle: [壊れた\n---\n\n## 中身\n", str(tmp_path / "out.pptx"))
+        assert "フロントマターの解析に失敗しました" in capsys.readouterr().out
+
+    def test_front_matter_without_title_is_ignored(self, gen, tmp_path):
+        """titleが無いフロントマターではタイトルスライドを作らない"""
+        gen.generate("---\nauthor: 著者\n---\n\n## 中身\n", str(tmp_path / "out.pptx"))
+        assert len(gen.prs.slides) == 1
+
+
+class TestLayoutComments:
+    @patch("processors.insert_image_fit")
+    def test_two_column_comment(self, mock_fit, gen, tmp_path, png_file):
+        """<!-- layout: 2-column --> で画像が右側に寄る"""
+        md = f"## 見出し\n\n<!-- layout: 2-column -->\n\n![img]({png_file})\n"
+        gen.generate(md, str(tmp_path / "out.pptx"))
+
+        assert gen.forced_layout == "2-column"
+        assert mock_fit.call_args[0][2] == Inches(5.2)
+
+    @patch("processors.insert_image_fit")
+    def test_center_comment(self, mock_fit, gen, tmp_path, png_file):
+        """<!-- layout: center --> で画像が中央に配置される"""
+        md = f"## 見出し\n\n本文\n\n<!-- layout: center -->\n\n![img]({png_file})\n"
+        gen.generate(md, str(tmp_path / "out.pptx"))
+        assert mock_fit.call_args[0][2] == Inches(1.0)
+
+    def test_layout_is_reset_on_new_slide(self, gen, tmp_path):
+        """新しい見出しでレイアウト指定はリセットされる"""
+        gen.generate("## 1枚目\n\n<!-- layout: center -->\n\n## 2枚目\n", str(tmp_path / "out.pptx"))
+        assert gen.forced_layout is None
+
+
+class TestSlideNumbers:
+    def test_numbers_are_added_except_first_slide(self, base_config, tmp_path):
+        """先頭スライドを除いてページ番号が挿入される"""
+        base_config["slides"]["show_slide_number"] = True
+        gen = PPTXGenerator(base_config)
+        gen.generate("# 表紙\n\n## 2枚目\n\n## 3枚目\n", str(tmp_path / "out.pptx"))
+
+        assert textboxes_of(gen.prs.slides[0]) == []
+        assert textboxes_of(gen.prs.slides[1])[0].text_frame.text == "1"
+        assert textboxes_of(gen.prs.slides[2])[0].text_frame.text == "2"
+
+    def test_numbers_can_be_disabled(self, base_config, tmp_path):
+        """show_slide_number: false で無効化できる"""
+        base_config["slides"]["show_slide_number"] = False
+        gen = PPTXGenerator(base_config)
+        gen.generate("# 表紙\n\n## 2枚目\n", str(tmp_path / "out.pptx"))
+        assert textboxes_of(gen.prs.slides[1]) == []
+
+    def test_enabled_by_default(self, tmp_path):
+        """設定が無い場合はページ番号を表示する"""
+        gen = PPTXGenerator({"slides": {"layout": "16:9"}})
+        gen.generate("# 表紙\n\n## 2枚目\n", str(tmp_path / "out.pptx"))
+        assert textboxes_of(gen.prs.slides[1])[0].text_frame.text == "1"
+
+
+class TestGenerate:
+    @patch("processors.insert_image_fit")
+    @patch("requests.get")
+    def test_markdown_integration(
+        self, mock_get, mock_insert_image, base_config, mock_response, tmp_path
+    ):
+        """Markdownのパースからスライド生成までの一連の結合テスト"""
+        mock_get.return_value = mock_response
+
+        md_content = """
 # タイトルスライド
 ここはタイトルです。
 
 ## テキストと装飾のテスト
+### 小見出し
 * 箇条書き1
 * **太字** と `インラインコード`
 
@@ -89,52 +950,195 @@ def test_markdown_integration(mock_get, mock_insert_image, base_config, tmp_path
 ```mermaid
 graph TD; A-->B;
 ```
-    """
 
-    gen = PPTXGenerator(base_config)
-    output_path = tmp_path / "test_output.pptx"
-    
-    # 生成処理の実行
-    gen.generate(md_content, str(output_path))
-    
-    # --- アサーション（結果の検証） ---
-    
-    # 1. ファイルが生成されたか
-    assert os.path.exists(output_path)
-    
-    # 2. スライドの枚数が正しいか（h1とh2の数 = 5枚）
-    assert len(gen.prs.slides) == 5
-    
-    # 3. ノートが正しく追加されたか（2枚目のスライド）
-    notes_text = gen.prs.slides[1].notes_slide.notes_text_frame.text
-    assert "これはスピーカーノートです。" in notes_text
-    
-    # 4. API通信と画像挿入が呼ばれたか（画像1回 + Mermaid1回 = 計2回）
-    assert mock_get.call_count == 2
-    assert mock_insert_image.call_count == 2
+## コードのテスト
+```python
+print(1)
+```
+"""
+        gen = PPTXGenerator(base_config)
+        output_path = tmp_path / "test_output.pptx"
+        gen.generate(md_content, str(output_path))
 
-def test_main_argparse(mocker):
-    """CLI引数パーサー(main関数)のテスト"""
-    from md2pptx import main
-    import sys
-    
-    # sys.argvをモックして、コマンドライン実行をシミュレート
-    test_args = ["md2pptx.py", "dummy.md", "-o", "out.pptx", "-c", "config.yaml"]
-    mocker.patch.object(sys, 'argv', test_args)
-    
-    # ファイル存在チェックをモック
-    mocker.patch('os.path.exists', return_value=True)
+        # ファイルが生成され、h1/h2の数だけスライドが作られる
+        assert os.path.exists(output_path)
+        assert len(gen.prs.slides) == 6
 
-    # === 重要：builtins.open ではなく md2pptx.open をパッチする ===
-    mocker.patch('md2pptx.open', mocker.mock_open(read_data="slides:\n  layout: 16:9"))
-    
-    mocker.patch('yaml.safe_load', return_value={"slides": {"layout": "16:9"}, "fonts": {}, "images": {}})
-    
-    # 実ファイルへの書き込みを避けるためにgenerateをモック
-    mock_gen_instance = MagicMock()
-    mocker.patch('md2pptx.PPTXGenerator', return_value=mock_gen_instance)
-    
-    main()
-    
-    # 処理が走り、generateが呼ばれたことを確認
-    mock_gen_instance.generate.assert_called_once()
+        # ノートが正しいスライドに追加される
+        notes = gen.prs.slides[1].notes_slide.notes_text_frame.text
+        assert "これはスピーカーノートです。" in notes
+
+        # 外部通信と画像挿入は 画像1回 + Mermaid1回
+        assert mock_get.call_count == 2
+        assert mock_insert_image.call_count == 2
+
+    def test_content_before_first_heading_is_ignored(self, gen, tmp_path):
+        """見出しより前の本文は配置先が無いため無視される"""
+        gen.generate("本文だけ\n\n# タイトル\n中身", str(tmp_path / "out.pptx"))
+
+        assert len(gen.prs.slides) == 1
+        assert gen.current_body.text == "中身"
+
+    def test_list_items_are_converted(self, gen, tmp_path):
+        """箇条書きは1項目につき1段落になる"""
+        gen.generate("# タイトル\n\n* 項目1\n* 項目2\n", str(tmp_path / "out.pptx"))
+        assert [p.text for p in gen.current_body.paragraphs] == ["項目1", "項目2"]
+
+    def test_list_item_paragraph_is_not_duplicated(self, gen, tmp_path):
+        """段落を含むリスト（loose list）でもpタグが二重に出力されない"""
+        gen.generate("# タイトル\n\n* 項目1\n\n* 項目2\n", str(tmp_path / "out.pptx"))
+        assert [p.text.strip() for p in gen.current_body.paragraphs] == ["項目1", "項目2"]
+
+    def test_blockquote_paragraph_is_not_duplicated(self, gen, tmp_path):
+        """引用内のpタグは本文に出力されない"""
+        gen.generate("# タイトル\n\n> ノート\n", str(tmp_path / "out.pptx"))
+
+        assert gen.current_body.text == ""
+        assert gen.current_slide.notes_slide.notes_text_frame.text == "ノート"
+
+    def test_hr_creates_additional_slide(self, gen, tmp_path):
+        """水平線でスライドが追加される"""
+        gen.generate("## 1枚目\n\n本文\n\n---\n\n続き\n", str(tmp_path / "out.pptx"))
+        assert len(gen.prs.slides) == 2
+
+
+# =====================================================================
+# md2pptx.py（CLI）
+# =====================================================================
+
+
+class TestApplyTheme:
+    def test_accent_and_text_colors(self):
+        """テーマ色が見出し系・本文系のフォント設定に展開される"""
+        config = apply_theme(
+            {"theme": {"accent_color": [1, 2, 3], "text_color": [4, 5, 6]}, "fonts": {}}
+        )
+
+        assert config["fonts"]["title_h1"]["color_rgb"] == [1, 2, 3]
+        assert config["fonts"]["table_header"]["color_rgb"] == [1, 2, 3]
+        assert config["fonts"]["body"]["color_rgb"] == [4, 5, 6]
+        assert config["fonts"]["table_body"]["color_rgb"] == [4, 5, 6]
+
+    def test_existing_font_settings_are_kept(self):
+        """既存のフォント設定（サイズ等）は保持したまま色だけ上書きする"""
+        config = apply_theme(
+            {
+                "theme": {"accent_color": [1, 2, 3]},
+                "fonts": {"title_h1": {"name": "Meiryo", "size_pt": 44}},
+            }
+        )
+
+        assert config["fonts"]["title_h1"]["name"] == "Meiryo"
+        assert config["fonts"]["title_h1"]["color_rgb"] == [1, 2, 3]
+
+    def test_without_fonts_section(self):
+        """fontsセクションが無くても展開できる"""
+        config = apply_theme({"theme": {"accent_color": [1, 2, 3]}})
+        assert config["fonts"]["title_h1"]["color_rgb"] == [1, 2, 3]
+
+    @pytest.mark.parametrize("config", [{}, {"theme": None}, {"theme": {}}])
+    def test_without_theme_is_noop(self, config):
+        """テーマが無い場合は設定を変更しない"""
+        assert apply_theme(config) == config
+
+
+class TestCli:
+    def test_parse_args_defaults(self):
+        """出力先と設定ファイルの既定値"""
+        args = parse_args(["input.md"])
+        assert (args.input, args.output, args.config) == (
+            "input.md",
+            "output.pptx",
+            "config.yaml",
+        )
+
+    def test_parse_args_options(self):
+        """オプション指定が反映される"""
+        args = parse_args(["in.md", "-o", "out.pptx", "-c", "my.yaml"])
+        assert (args.output, args.config) == ("out.pptx", "my.yaml")
+
+    def test_load_config(self, tmp_path):
+        """YAML設定ファイルを辞書として読み込む"""
+        path = tmp_path / "c.yaml"
+        path.write_text("slides:\n  layout: '4:3'\n", encoding="utf-8")
+        assert load_config(str(path)) == {"slides": {"layout": "4:3"}}
+
+    def test_load_config_empty_file(self, tmp_path):
+        """空のYAMLは空の辞書として扱う（Noneを返さない）"""
+        path = tmp_path / "empty.yaml"
+        path.write_text("", encoding="utf-8")
+        assert load_config(str(path)) == {}
+
+    def test_read_text_file(self, tmp_path):
+        """UTF-8のテキストを読み込む"""
+        path = tmp_path / "a.md"
+        path.write_text("# 日本語", encoding="utf-8")
+        assert read_text_file(str(path)) == "# 日本語"
+
+    def _write_project(self, tmp_path, config_text="slides:\n  layout: '16:9'\n"):
+        md = tmp_path / "in.md"
+        md.write_text("# タイトル\n本文\n", encoding="utf-8")
+        conf = tmp_path / "c.yaml"
+        conf.write_text(config_text, encoding="utf-8")
+        return str(md), str(conf), str(tmp_path / "out.pptx")
+
+    def test_main_success(self, tmp_path, capsys):
+        """正常系では0を返しファイルを生成する"""
+        md, conf, out = self._write_project(tmp_path)
+
+        assert main([md, "-o", out, "-c", conf]) == 0
+        assert os.path.exists(out)
+        assert "Success" in capsys.readouterr().out
+
+    def test_main_with_empty_config(self, tmp_path):
+        """空の設定ファイルでも変換できる"""
+        md, conf, out = self._write_project(tmp_path, config_text="")
+        assert main([md, "-o", out, "-c", conf]) == 0
+
+    def test_main_applies_theme(self, tmp_path, mocker):
+        """テーマ設定がジェネレーターに渡る設定へ反映される"""
+        md, conf, out = self._write_project(
+            tmp_path, config_text="theme:\n  accent_color: [1, 2, 3]\n"
+        )
+        spy = mocker.spy(md2pptx, "PPTXGenerator")
+
+        assert main([md, "-o", out, "-c", conf]) == 0
+        assert spy.call_args[0][0]["fonts"]["title_h1"]["color_rgb"] == [1, 2, 3]
+
+    def test_main_uses_sys_argv_by_default(self, tmp_path, mocker):
+        """引数を渡さない場合はsys.argvを解析する"""
+        md, conf, out = self._write_project(tmp_path)
+        mocker.patch.object(md2pptx.sys, "argv", ["md2pptx.py", md, "-o", out, "-c", conf])
+        assert main() == 0
+
+    def test_main_missing_input(self, tmp_path, capsys):
+        """入力ファイルが無い場合は1を返す"""
+        _, conf, out = self._write_project(tmp_path)
+
+        assert main(["no_such.md", "-o", out, "-c", conf]) == 1
+        assert "入力ファイル" in capsys.readouterr().out
+
+    def test_main_missing_config(self, tmp_path, capsys):
+        """設定ファイルが無い場合は1を返す"""
+        md, _, out = self._write_project(tmp_path)
+
+        assert main([md, "-o", out, "-c", "no_such.yaml"]) == 1
+        assert "設定ファイル" in capsys.readouterr().out
+
+    def test_main_permission_error(self, tmp_path, mocker, capsys):
+        """出力先に書き込めない場合は専用のメッセージを表示する"""
+        md, conf, out = self._write_project(tmp_path)
+        mocker.patch.object(PPTXGenerator, "generate", side_effect=PermissionError)
+
+        assert main([md, "-o", out, "-c", conf]) == 1
+        assert "書き込めません" in capsys.readouterr().out
+
+    def test_main_unexpected_error(self, tmp_path, mocker, capsys):
+        """想定外の例外はメッセージとトレースバックを表示して1を返す"""
+        md, conf, out = self._write_project(tmp_path)
+        mocker.patch.object(PPTXGenerator, "generate", side_effect=ValueError("boom"))
+
+        assert main([md, "-o", out, "-c", conf]) == 1
+        captured = capsys.readouterr()
+        assert "予期せぬエラー" in captured.out
+        assert "ValueError" in captured.err

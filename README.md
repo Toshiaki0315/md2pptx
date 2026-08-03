@@ -59,9 +59,9 @@ pytest
 ### 3. カバレッジ（網羅率）の計測
 コードの何割がテストされているかを確認し、レポートを表示します。
 ```bash
-pytest --cov=md2pptx --cov-report=term-missing
+pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov-report=term-missing
 ```
-現在のカバレッジは **100%**（85テスト）です。外部API（Kroki）やHTTP画像取得はすべてモック化しているため、テスト実行時にネットワーク接続は不要です。
+現在のカバレッジは **99%**（127テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得はすべてモック化しているため、テスト実行時にネットワーク接続は不要です。
 
 ## 📝 Markdownの書き方とスライドへの反映
 

@@ -15,6 +15,13 @@ from utils import (
     auto_shrink_text
 )
 
+# 外部API（画像取得・Mermaid変換）のタイムアウト秒数
+HTTP_TIMEOUT_SEC = 15
+
+# Mermaid図形をPNG化するAPI（Krokiが応答しない場合はmermaid.inkにフォールバック）
+KROKI_MERMAID_PNG_URL = "https://kroki.io/mermaid/png/"
+MERMAID_INK_URL = "https://mermaid.ink/img/"
+
 def process_heading(generator, tag):
     """見出しタグの処理とスライド作成"""
     if generator.current_slide:
@@ -115,11 +122,23 @@ def process_blockquote(generator, tag):
     note_text = tag.get_text(strip=True)
     text_frame.text = text_frame.text + "\n\n" + note_text if text_frame.text else note_text
 
+def load_image(src):
+    """画像URLならダウンロードし、ローカルパスならそのまま返す"""
+    if src.startswith(('http://', 'https://')):
+        response = requests.get(src, timeout=HTTP_TIMEOUT_SEC)
+        response.raise_for_status()
+        return BytesIO(response.content)
+    return src
+
 def process_image(generator, tag):
     """画像の挿入処理"""
     img_url = tag.get('src')
+    if not img_url:
+        print("Warning: src属性が無い画像をスキップしました。")
+        return
+
     try:
-        img_data = BytesIO(requests.get(img_url).content) if img_url.startswith('http') else img_url
+        img_data = load_image(img_url)
         pos = generator.images_conf.get('position_inches')
         
         if pos and len(pos) >= 2:
@@ -172,12 +191,29 @@ def process_table(generator, tag):
                 add_runs_from_tag(generator, col, p, font_conf)
     generator.slide_has_text = True
 
+def render_mermaid(text):
+    """Mermaid記法をPNG画像に変換する（Kroki優先、失敗時はmermaid.inkにフォールバック）"""
+    compressed = zlib.compress(text.encode('utf-8'), 9)
+    encoded = base64.urlsafe_b64encode(compressed).decode('ascii')
+
+    try:
+        response = requests.get(f"{KROKI_MERMAID_PNG_URL}{encoded}", timeout=HTTP_TIMEOUT_SEC)
+        response.raise_for_status()
+    except Exception as e_kroki:
+        print(f"INFO: Kroki APIが応答しませんでした。代替API(mermaid.ink)を試行します... ({e_kroki})")
+        encoded_ink = base64.urlsafe_b64encode(text.encode('utf-8')).decode('ascii')
+        response = requests.get(f"{MERMAID_INK_URL}{encoded_ink}", timeout=HTTP_TIMEOUT_SEC)
+        response.raise_for_status()
+
+    return response
+
 def process_code_or_mermaid(generator, tag):
     """コードブロックまたはMermaid図形の処理"""
     code_tag = tag.find('code')
-    classes = code_tag.get('class') if code_tag else []
+    # class属性が無いコードブロックでは get('class') が None を返すため、必ず空リストへ倒す
+    classes = (code_tag.get('class') or []) if code_tag else []
     is_mermaid = 'language-mermaid' in classes or 'mermaid' in classes
-    
+
     language = None
     for cls in classes:
         if cls.startswith('language-'):
@@ -187,23 +223,8 @@ def process_code_or_mermaid(generator, tag):
     if is_mermaid:
         try:
             print("INFO: Mermaid図形をAPIで生成中...")
-            text = code_tag.get_text()
-            
-            # Kroki API
-            compressed = zlib.compress(text.encode('utf-8'), 9)
-            encoded = base64.urlsafe_b64encode(compressed).decode('ascii')
-            
-            response = None
-            try:
-                response = requests.get(f"https://kroki.io/mermaid/png/{encoded}", timeout=15)
-                response.raise_for_status()
-            except Exception as e_kroki:
-                print(f"INFO: Kroki APIが応答しませんでした。代替API(mermaid.ink)を試行します... ({e_kroki})")
-                # mermaid.ink へのフォールバック
-                encoded_ink = base64.urlsafe_b64encode(text.encode('utf-8')).decode('ascii')
-                response = requests.get(f"https://mermaid.ink/img/{encoded_ink}", timeout=15)
-                response.raise_for_status()
-            
+            response = render_mermaid(code_tag.get_text())
+
             if generator.slide_has_text:
                 shrink_body_shape(generator, width_inches=4.8)
                 insert_image_fit(generator.current_slide, BytesIO(response.content), Inches(5.2), Inches(1.5), Inches(4.5), Inches(3.8))

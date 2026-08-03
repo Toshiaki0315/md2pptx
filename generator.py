@@ -3,7 +3,7 @@ import yaml
 from pptx import Presentation
 from pptx.util import Inches
 import markdown
-from bs4 import BeautifulSoup, Comment
+from bs4 import BeautifulSoup, Comment, Tag
 from utils import apply_font_style
 
 from processors import (
@@ -17,14 +17,18 @@ from processors import (
     process_text
 )
 
+# スライドへ変換する対象のHTMLタグ
+TARGET_TAGS = ['h1', 'h2', 'h3', 'hr', 'p', 'li', 'img', 'pre', 'table', 'blockquote']
+
+
 class PPTXGenerator:
     """MarkdownをPowerPointに変換するジェネレータークラス"""
 
     def __init__(self, config):
-        self.config = config
-        self.slides_conf = config.get('slides', {})
-        self.fonts_conf = config.get('fonts', {})
-        self.images_conf = config.get('images', {})
+        self.config = config or {}
+        self.slides_conf = self.config.get('slides') or {}
+        self.fonts_conf = self.config.get('fonts') or {}
+        self.images_conf = self.config.get('images') or {}
         
         self.prs = None
         self.current_slide = None
@@ -104,7 +108,11 @@ class PPTXGenerator:
         soup = BeautifulSoup(html, 'html.parser')
 
         # 2. タグとコメントの処理
-        for element in soup.find_all(['h1', 'h2', 'h3', 'hr', 'p', 'li', 'img', 'pre', 'table', 'blockquote', lambda tag: isinstance(tag, Comment)]):
+        #
+        # コメント（<!-- layout: ... -->）はTagではなくNavigableStringのため、
+        # find_all(名前リスト) では拾えない。文書順を保ったまま両方を扱うために
+        # descendants を走査する。
+        for element in list(soup.descendants):
             if isinstance(element, Comment):
                 text = element.strip()
                 if text.startswith('layout:'):
@@ -112,6 +120,9 @@ class PPTXGenerator:
                     self.forced_layout = layout_val
                     if layout_val == '2-column':
                         self.slide_has_text = True # 画像や表を右側に寄せるためのフラグ
+                continue
+
+            if not isinstance(element, Tag) or element.name not in TARGET_TAGS:
                 continue
 
             tag = element
