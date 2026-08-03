@@ -11,6 +11,7 @@ import base64
 import os
 import subprocess
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import markdown
@@ -51,8 +52,8 @@ from processors import (
 from utils import (
     DEFAULT_IMAGE_DPI,
     add_runs_from_tag,
-    append_code_textbox,
     append_text_block,
+    create_code_textbox,
     apply_font_style,
     auto_shrink_text,
     downscale_image,
@@ -360,7 +361,9 @@ class TestInsertImageFit:
 class TestAddRunsFromTag:
     def _runs_for(self, gen, html):
         p = new_paragraph()
-        add_runs_from_tag(gen, parse_html(html).p, p, {"name": "Meiryo"})
+        add_runs_from_tag(
+            parse_html(html).p, p, {"name": "Meiryo"}, gen.fonts_conf.get("inline_code")
+        )
         return p.runs
 
     def test_bold_and_italic(self, gen):
@@ -406,10 +409,67 @@ class TestAddRunsFromTag:
         assert runs[0].text == "1行目 2行目"
 
 
+class TestUtilsArePure:
+    """utils はジェネレーターに依存しない（引数だけで完結する）"""
+
+    def test_no_generator_import(self):
+        """utils モジュールが generator を参照していない"""
+        source = (Path(utils.__file__)).read_text(encoding="utf-8")
+        assert "generator" not in source
+
+    def test_add_runs_works_without_generator(self):
+        """ジェネレーターを作らずにインライン装飾を描画できる"""
+        p = new_paragraph()
+        add_runs_from_tag(
+            parse_html("<p>本文<code>x</code></p>").p,
+            p,
+            {"name": "Meiryo"},
+            {"name": "Courier", "color_rgb": [1, 2, 3]},
+        )
+
+        assert [r.text for r in p.runs] == ["本文", "x"]
+        assert p.runs[1].font.name == "Courier"
+        assert p.runs[1].font.color.rgb == RGBColor(1, 2, 3)
+
+    def test_inline_code_defaults_without_config(self):
+        """インラインコードの設定を渡さなくても既定値が使われる"""
+        p = new_paragraph()
+        add_runs_from_tag(parse_html("<p><code>x</code></p>").p, p, None)
+
+        assert p.runs[0].font.name == "Consolas"
+        assert p.runs[0].font.color.rgb == RGBColor(220, 20, 60)
+
+    def test_append_text_block_takes_a_text_frame(self):
+        """本文枠を直接渡して段落を追加できる"""
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        text_frame = slide.shapes.add_textbox(
+            Inches(1), Inches(1), Inches(4), Inches(2)
+        ).text_frame
+
+        append_text_block(text_frame, parse_md("本文").find("p"), reuse_first_paragraph=True)
+        assert text_frame.paragraphs[0].runs[0].text == "本文"
+
+    def test_create_code_textbox_takes_a_slide(self):
+        """スライドと寸法を渡すだけでコード枠を作れる"""
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+        create_code_textbox(
+            slide, Inches(1), Inches(1), Inches(4), Inches(2),
+            content="print(1)", language="python",
+            font_conf={"name": "Consolas", "size_pt": 12}, background_rgb=[1, 2, 3],
+        )
+
+        box = textboxes_of(slide)[0]
+        assert box.fill.fore_color.rgb == RGBColor(1, 2, 3)
+        assert "print" in box.text_frame.text
+
+
 class TestShrinkBodyShape:
     def test_width_is_applied(self, gen_with_slide):
         """指定した幅が本文枠に反映される"""
-        shrink_body_shape(gen_with_slide, Inches(4.8))
+        shrink_body_shape(gen_with_slide.current_slide, Inches(4.8))
         assert gen_with_slide.current_slide.placeholders[1].width == Inches(4.8)
 
     def test_inherited_geometry_is_kept(self, gen_with_slide):
@@ -421,34 +481,43 @@ class TestShrinkBodyShape:
         shape = gen_with_slide.current_slide.placeholders[1]
         top, height = shape.top, shape.height
 
-        shrink_body_shape(gen_with_slide, Inches(4.8))
+        shrink_body_shape(gen_with_slide.current_slide, Inches(4.8))
 
         assert shape.left > 0
         assert (shape.top, shape.height) == (top, height)
 
     def test_max_height_is_applied(self, gen_with_slide):
         """max_height を渡すと高さも縮む"""
-        shrink_body_shape(gen_with_slide, Inches(8.0), max_height=Inches(2.0))
+        shrink_body_shape(gen_with_slide.current_slide, Inches(8.0), max_height=Inches(2.0))
         assert gen_with_slide.current_slide.placeholders[1].height == Inches(2.0)
 
     def test_without_slide_is_noop(self, gen):
         """スライド未作成でも例外にならない"""
-        shrink_body_shape(gen, Inches(4.8))
+        shrink_body_shape(gen.current_slide, Inches(4.8))
 
 
 class TestAppendTextBlock:
     def test_first_paragraph_is_reused_then_appended(self, gen_with_slide):
         """最初の段落は空の既存段落を再利用し、以降は追加される"""
-        append_text_block(gen_with_slide, parse_md("1つ目").find("p"))
+        append_text_block(
+            gen_with_slide.current_body, parse_md("1つ目").find("p"),
+            reuse_first_paragraph=True,
+        )
         assert len(gen_with_slide.current_body.paragraphs) == 1
 
         gen_with_slide.slide_has_text = True
-        append_text_block(gen_with_slide, parse_md("2つ目").find("p"))
+        append_text_block(
+            gen_with_slide.current_body, parse_md("2つ目").find("p"),
+            reuse_first_paragraph=False,
+        )
         assert len(gen_with_slide.current_body.paragraphs) == 2
 
     def test_level_and_spacing(self, gen_with_slide):
         """レベルと行間・段落後余白が設定される"""
-        append_text_block(gen_with_slide, parse_md("* 項目").find("li"), level=2)
+        append_text_block(
+            gen_with_slide.current_body, parse_md("* 項目").find("li"),
+            reuse_first_paragraph=True, level=2,
+        )
         p = gen_with_slide.current_body.paragraphs[0]
         assert p.level == 2
         assert p.space_after == Pt(12)
@@ -458,7 +527,7 @@ class TestAppendTextBlock:
 class TestAppendCodeTextbox:
     def test_creates_textbox_with_background(self, gen_with_slide):
         """コードは背景色付きの独立したテキストボックスに描画される"""
-        append_code_textbox(gen_with_slide, "print(1)", language="python")
+        processors.append_code_textbox(gen_with_slide, "print(1)", language="python")
 
         boxes = textboxes_of(gen_with_slide.current_slide)
         assert len(boxes) == 1
@@ -471,12 +540,12 @@ class TestAppendCodeTextbox:
         gen = PPTXGenerator(base_config)
         process_heading(gen, parse_md("## 見出し").find("h2"))
 
-        append_code_textbox(gen, "print(1)", language="python")
+        processors.append_code_textbox(gen, "print(1)", language="python")
         assert textboxes_of(gen.current_slide)[0].fill.fore_color.rgb == RGBColor(1, 2, 3)
 
     def test_syntax_highlight_splits_runs(self, gen_with_slide):
         """シンタックスハイライトによりトークンごとにrunが分割される"""
-        append_code_textbox(gen_with_slide, "def f():\n    return 1\n", language="python")
+        processors.append_code_textbox(gen_with_slide, "def f():\n    return 1\n", language="python")
 
         runs = textboxes_of(gen_with_slide.current_slide)[0].text_frame.paragraphs[0].runs
         assert len(runs) > 1
@@ -485,21 +554,21 @@ class TestAppendCodeTextbox:
 
     def test_unknown_language_falls_back_to_plain(self, gen_with_slide):
         """未知の言語指定でも例外にせずプレーンテキストとして描画する"""
-        append_code_textbox(gen_with_slide, "hello", language="no_such_language")
+        processors.append_code_textbox(gen_with_slide, "hello", language="no_such_language")
         runs = textboxes_of(gen_with_slide.current_slide)[0].text_frame.paragraphs[0].runs
         # pygmentsは末尾に改行を補うため、内容の一致のみを確認する
         assert "".join(r.text for r in runs).strip() == "hello"
 
     def test_language_is_guessed_when_omitted(self, gen_with_slide):
         """言語未指定でも推定してハイライトする"""
-        append_code_textbox(gen_with_slide, "def f():\n    return 1\n", language=None)
+        processors.append_code_textbox(gen_with_slide, "def f():\n    return 1\n", language=None)
         runs = textboxes_of(gen_with_slide.current_slide)[0].text_frame.paragraphs[0].runs
         assert "".join(r.text for r in runs) == "def f():\n    return 1\n"
 
     def test_two_column_layout_shrinks_body(self, gen_with_slide):
         """テキストがある場合は本文枠を縮めて右側に配置する"""
         gen_with_slide.slide_has_text = True
-        append_code_textbox(gen_with_slide, "x", language="python")
+        processors.append_code_textbox(gen_with_slide, "x", language="python")
 
         assert gen_with_slide.current_slide.placeholders[1].width == Inches(4.5)
         assert textboxes_of(gen_with_slide.current_slide)[0].left == Inches(5.0)
@@ -507,12 +576,12 @@ class TestAppendCodeTextbox:
     def test_center_layout(self, gen_with_slide):
         """forced_layout=center では中央寄せの枠になる"""
         gen_with_slide.forced_layout = "center"
-        append_code_textbox(gen_with_slide, "x", language="python")
+        processors.append_code_textbox(gen_with_slide, "x", language="python")
         assert textboxes_of(gen_with_slide.current_slide)[0].left == Inches(1.5)
 
     def test_default_layout(self, gen_with_slide):
         """テキストが無い場合はスライド幅いっぱいに配置する"""
-        append_code_textbox(gen_with_slide, "x", language="python")
+        processors.append_code_textbox(gen_with_slide, "x", language="python")
         box = textboxes_of(gen_with_slide.current_slide)[0]
         assert (box.left, box.width) == (Inches(1.0), Inches(8.0))
 
@@ -522,7 +591,10 @@ class TestAutoShrinkText:
         for i in range(line_count):
             gen.slide_has_text = i > 0
             body = parse_md(text or f"行{i}").find("p")
-            append_text_block(gen, body, font_conf={"size_pt": 20})
+            append_text_block(
+                gen.current_body, body,
+                reuse_first_paragraph=not gen.slide_has_text, font_conf={"size_pt": 20},
+            )
 
     def _sizes(self, gen):
         return [

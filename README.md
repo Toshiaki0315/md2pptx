@@ -62,7 +62,7 @@ pytest
 ```bash
 pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov=mermaid_renderer --cov=layout --cov=text_metrics --cov-report=term-missing
 ```
-現在のカバレッジは **99%**（226テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
+現在のカバレッジは **99%**（231テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
 
 ### 4. 型チェック（mypy）
 全モジュールに型アノテーションを付与しています。設定は `mypy.ini` にあります。
