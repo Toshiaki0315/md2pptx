@@ -10,6 +10,13 @@ from typing import IO, TYPE_CHECKING, Any, Union
 
 from PIL import Image
 from pptx.util import Emu, Inches, Length, Pt
+
+from text_metrics import (
+    DEFAULT_FONT_SIZE_PT,
+    DEFAULT_LINE_SPACING,
+    ParagraphMetrics,
+    fit_scale,
+)
 from pptx.dml.color import RGBColor
 from bs4 import NavigableString, Tag
 from pygments import lex
@@ -280,24 +287,54 @@ def append_code_textbox(
 
     generator.slide_has_text = True
 
+def _paragraph_metrics(paragraph: _Paragraph) -> ParagraphMetrics:
+    """段落から高さ概算に必要な情報を取り出す"""
+    sizes = [run.font.size.pt for run in paragraph.runs if run.font.size]
+    if paragraph.font.size:
+        sizes.append(paragraph.font.size.pt)
+    font_size = max(sizes) if sizes else DEFAULT_FONT_SIZE_PT
+
+    # line_spacing は倍率（float）か絶対値（Length）のどちらもあり得る
+    spacing = paragraph.line_spacing
+    line_spacing = float(spacing) if isinstance(spacing, (int, float)) else DEFAULT_LINE_SPACING
+
+    return ParagraphMetrics(
+        text=paragraph.text,
+        font_size_pt=font_size,
+        level=paragraph.level,
+        line_spacing=line_spacing,
+        space_after_pt=paragraph.space_after.pt if paragraph.space_after else 0.0,
+    )
+
+
 def auto_shrink_text(slide: Slide | None) -> None:
-    """スライド内のテキスト行数が多い場合、フォントサイズと余白を自動で縮小してはみ出しを防ぐ"""
+    """本文が枠に収まらない場合、フォントサイズと余白を自動で縮小する
+
+    段落数ではなく、文字幅（全角/半角）から**折り返し後の行数**を概算して判定する。
+    長い1段落が何行にも折り返してはみ出すケースを拾うため。
+    """
     if not slide: return
     try:
-        if len(slide.placeholders) > 1:
-            body = slide.placeholders[1]
-            if not body.has_text_frame: return
+        if len(slide.placeholders) <= 1: return
+        body = slide.placeholders[1]
+        if not body.has_text_frame: return
 
-            tf = body.text_frame
-            line_count = sum(1 for p in tf.paragraphs if p.text.strip())
+        tf = body.text_frame
+        paragraphs = list(tf.paragraphs)
+        if not any(p.text.strip() for p in paragraphs): return
 
-            if line_count > 6: # 6行を超えたら縮小を開始（より早めに設定）
-                shrink_factor = max(0.6, 1.0 - (line_count - 6) * 0.06) # 縮小率を強化
-                for p in tf.paragraphs:
-                    if p.space_after:
-                        p.space_after = Pt(p.space_after.pt * shrink_factor)
-                    for run in p.runs:
-                        if run.font.size:
-                            run.font.size = Pt(int(run.font.size.pt * shrink_factor))
+        available_width = Emu(int(body.width - tf.margin_left - tf.margin_right)).pt
+        available_height = Emu(int(body.height - tf.margin_top - tf.margin_bottom)).pt
+
+        metrics = [_paragraph_metrics(p) for p in paragraphs]
+        scale = fit_scale(metrics, available_width, available_height)
+        if scale >= 1.0: return
+
+        for p in paragraphs:
+            if p.space_after:
+                p.space_after = Pt(p.space_after.pt * scale)
+            for run in p.runs:
+                if run.font.size:
+                    run.font.size = Pt(int(run.font.size.pt * scale))
     except Exception:
         pass

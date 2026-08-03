@@ -25,8 +25,17 @@ import md2pptx
 import mermaid_renderer
 import processors
 import utils
+import text_metrics
 from generator import PPTXGenerator
 from layout import SlideLayout
+from text_metrics import (
+    ParagraphMetrics,
+    char_width_ratio,
+    estimate_height_pt,
+    estimate_line_count,
+    estimate_text_width_pt,
+    fit_scale,
+)
 from mermaid_renderer import MermaidRenderError, mermaid_conf, render_mermaid
 from md2pptx import apply_theme, load_config, main, parse_args, read_text_file
 from processors import (
@@ -509,13 +518,51 @@ class TestAppendCodeTextbox:
 
 
 class TestAutoShrinkText:
-    def _fill_body(self, gen, line_count):
+    def _fill_body(self, gen, line_count, text=None):
         for i in range(line_count):
             gen.slide_has_text = i > 0
-            append_text_block(gen, parse_md(f"行{i}").find("p"), font_conf={"size_pt": 20})
+            body = parse_md(text or f"行{i}").find("p")
+            append_text_block(gen, body, font_conf={"size_pt": 20})
+
+    def _sizes(self, gen):
+        return [
+            run.font.size.pt for p in gen.current_body.paragraphs for run in p.runs
+            if run.font.size
+        ]
+
+    def test_long_single_paragraph_is_shrunk(self, gen_with_slide):
+        """折り返しの多い長い1段落も縮小される
+
+        段落数だけを数えていた頃は「1段落」と判定され、
+        実際には10行以上に折り返してはみ出していても縮小されなかった。
+        """
+        self._fill_body(gen_with_slide, 1, text="これは非常に長い一段落です。" * 30)
+        auto_shrink_text(gen_with_slide.current_slide)
+
+        assert all(size < 20 for size in self._sizes(gen_with_slide))
+
+    def test_short_single_paragraph_is_untouched(self, gen_with_slide):
+        """短い1段落は縮小しない"""
+        self._fill_body(gen_with_slide, 1, text="短い本文です。")
+        auto_shrink_text(gen_with_slide.current_slide)
+
+        assert all(size == 20 for size in self._sizes(gen_with_slide))
+
+    def test_fullwidth_text_shrinks_more_than_halfwidth(self, gen_with_slide, gen):
+        """同じ文字数なら、全角のほうが幅を取るため強く縮小される"""
+        self._fill_body(gen_with_slide, 1, text="あ" * 300)
+        auto_shrink_text(gen_with_slide.current_slide)
+        fullwidth = min(self._sizes(gen_with_slide))
+
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+        self._fill_body(gen, 1, text="a" * 300)
+        auto_shrink_text(gen.current_slide)
+        halfwidth = min(self._sizes(gen))
+
+        assert fullwidth < halfwidth
 
     def test_shrinks_when_too_many_lines(self, gen_with_slide):
-        """行数が閾値を超えるとフォントサイズが縮小される"""
+        """行数が枠に収まらない場合はフォントサイズが縮小される"""
         self._fill_body(gen_with_slide, 12)
         auto_shrink_text(gen_with_slide.current_slide)
 
@@ -955,6 +1002,102 @@ class TestProcessText:
 
         process_text(gen, parse_md("* 項目").find("li"))
         assert gen.current_body.paragraphs[0].runs[0].font.size == Pt(18)
+
+
+# =====================================================================
+# text_metrics.py
+# =====================================================================
+
+
+class TestCharWidth:
+    @pytest.mark.parametrize("ch", ["あ", "漢", "全", "ー", "、"])
+    def test_fullwidth_characters(self, ch):
+        """日本語は全角幅として扱う"""
+        assert char_width_ratio(ch) == 1.0
+
+    @pytest.mark.parametrize("ch", ["a", "Z", "1", " ", "-"])
+    def test_halfwidth_characters(self, ch):
+        """英数字・記号は半角幅として扱う"""
+        assert char_width_ratio(ch) == 0.5
+
+    def test_width_of_mixed_text(self):
+        """全角と半角が混在してもそれぞれの幅で合算される"""
+        # 全角2文字(=2.0) + 半角4文字(=2.0) → 合計4.0文字ぶん
+        assert estimate_text_width_pt("あいabcd", 10) == pytest.approx(40.0)
+
+
+class TestEstimateLineCount:
+    def test_text_wraps_by_available_width(self):
+        """枠幅を超えるテキストは折り返して複数行になる"""
+        # 全角20文字 × 10pt = 200pt を 100pt 幅に入れる → 2行
+        assert estimate_line_count("あ" * 20, 10, 100) == 2
+
+    def test_short_text_is_single_line(self):
+        assert estimate_line_count("短い", 10, 500) == 1
+
+    @pytest.mark.parametrize("text, width", [("", 100), ("あ", 0), ("あ", -10)])
+    def test_degenerate_cases_are_one_line(self, text, width):
+        """空文字や幅が取れない場合も1行として扱う（0除算を避ける）"""
+        assert estimate_line_count(text, 10, width) == 1
+
+
+class TestEstimateHeight:
+    def _para(self, text, size=10, level=0, spacing=1.0, space_after=0.0):
+        return ParagraphMetrics(text, size, level, spacing, space_after)
+
+    def test_single_line_height(self):
+        """1行の高さは フォントサイズ × 行送り"""
+        assert estimate_height_pt([self._para("あ", spacing=1.2)], 500) == pytest.approx(12.0)
+
+    def test_wrapped_lines_are_counted(self):
+        """折り返した行数ぶんの高さになる"""
+        # 全角30文字 × 10pt = 300pt を 100pt 幅 → 3行
+        assert estimate_height_pt([self._para("あ" * 30)], 100) == pytest.approx(30.0)
+
+    def test_space_after_is_included(self):
+        assert estimate_height_pt([self._para("あ", space_after=5.0)], 500) == pytest.approx(15.0)
+
+    def test_indent_reduces_available_width(self):
+        """箇条書きのレベルが深いほど幅が狭まり、行数が増える"""
+        flat = estimate_height_pt([self._para("あ" * 30, level=0)], 300)
+        nested = estimate_height_pt([self._para("あ" * 30, level=3)], 300)
+        assert nested > flat
+
+    def test_scale_reduces_height(self):
+        """縮小率を掛けると必要な高さが下がる"""
+        paragraphs = [self._para("あ" * 30)]
+        assert estimate_height_pt(paragraphs, 100, scale=0.5) < estimate_height_pt(
+            paragraphs, 100
+        )
+
+
+class TestFitScale:
+    def _paras(self, count, text="あ" * 20, size=20):
+        return [ParagraphMetrics(text, size) for _ in range(count)]
+
+    def test_no_shrink_when_it_fits(self):
+        """収まっている場合は縮小しない"""
+        assert fit_scale(self._paras(1), 500, 1000) == 1.0
+
+    def test_shrinks_when_overflowing(self):
+        """収まらない場合は1.0未満の縮小率を返す"""
+        scale = fit_scale(self._paras(20), 500, 200)
+        assert scale < 1.0
+
+    def test_result_actually_fits(self):
+        """返した縮小率で実際に枠へ収まる"""
+        paragraphs = self._paras(10)
+        scale = fit_scale(paragraphs, 500, 300)
+        assert estimate_height_pt(paragraphs, 500, scale) <= 300
+
+    def test_scale_has_a_floor(self):
+        """極端に多い場合でも下限より小さくはしない（読めなくなるため）"""
+        assert fit_scale(self._paras(500), 500, 50) == text_metrics.MIN_SHRINK_SCALE
+
+    @pytest.mark.parametrize("paragraphs, height", [([], 100), ([ParagraphMetrics("あ", 10)], 0)])
+    def test_degenerate_cases_do_not_shrink(self, paragraphs, height):
+        """段落が無い・高さが取れない場合は縮小しない"""
+        assert fit_scale(paragraphs, 500, height) == 1.0
 
 
 # =====================================================================

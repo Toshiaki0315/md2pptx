@@ -60,9 +60,9 @@ pytest
 ### 3. カバレッジ（網羅率）の計測
 コードの何割がテストされているかを確認し、レポートを表示します。
 ```bash
-pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov=mermaid_renderer --cov=layout --cov-report=term-missing
+pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov=mermaid_renderer --cov=layout --cov=text_metrics --cov-report=term-missing
 ```
-現在のカバレッジは **99%**（196テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
+現在のカバレッジは **99%**（226テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
 
 ### 4. 型チェック（mypy）
 全モジュールに型アノテーションを付与しています。設定は `mypy.ini` にあります。
@@ -84,6 +84,7 @@ pip install types-requests types-PyYAML types-Markdown
 ### 2. テキストとリスト
 通常のテキスト、およびネストされたリスト（`-` や `*`）に対応しています[cite: 1, 2, 3]。
 段落やリスト間の余白・行間は美しくなるよう自動で調整されます。
+本文が枠に収まらない場合は、**全角/半角を考慮した折り返し行数から必要な高さを概算**し、フォントサイズと余白を自動で縮小します（下限は元の60%）。
 `**太字**`、`*斜体*`、`` `インラインコード` `` の装飾も反映されます[cite: 2]。
 
 ### 3. スピーカーノート（発表者ツール）
