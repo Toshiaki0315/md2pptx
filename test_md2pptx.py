@@ -653,6 +653,50 @@ class TestAutoShrinkText:
         ]
         assert sizes and all(size == Pt(20) for size in sizes)
 
+    def test_heading_and_bullets_fit_in_the_frame(self, base_config, tmp_path):
+        """h3見出しを含む本文がスライドからはみ出さない
+
+        sample.md の「現状の分析と課題」で実際にはみ出していたケースの回帰テスト。
+        h3 の space_before と、フォントの行高を考慮していなかったことが原因だった。
+        """
+        base_config["fonts"]["bullet_level_1"] = {"size_pt": 18}
+        base_config["fonts"]["title_h3"] = {"size_pt": 20, "bold": True}
+        gen = PPTXGenerator(base_config)
+
+        md = (
+            "## 現状の分析と課題\n\n現場では多くの課題が山積しています。\n\n"
+            "### システムの老朽化\n* 既存システムの動作が遅い\n* メンテナンス担当者が不在\n\n"
+            "### コミュニケーションの課題\n* 部署間での情報共有にタイムラグがある\n"
+            "* 手作業によるデータ入力の負荷が高い\n"
+        )
+        gen.generate(md, str(tmp_path / "out.pptx"))
+
+        body = gen.prs.slides[0].placeholders[1]
+        tf = body.text_frame
+        needed = estimate_height_pt(
+            [utils._paragraph_metrics(p) for p in tf.paragraphs],
+            Emu(int(body.width - tf.margin_left - tf.margin_right)).pt,
+        )
+        assert needed <= Emu(int(body.height - tf.margin_top - tf.margin_bottom)).pt
+
+    def test_paragraph_level_font_size_is_also_shrunk(self, gen_with_slide):
+        """段落レベルのフォントサイズ（h3が設定する基準値）も縮小対象にする"""
+        self._fill_body(gen_with_slide, 1, text="あ" * 400)
+        target = gen_with_slide.current_body.paragraphs[0]
+        target.font.size = Pt(20)
+
+        auto_shrink_text(gen_with_slide.current_slide)
+        assert target.font.size.pt < 20
+
+    def test_space_before_is_shrunk(self, gen_with_slide):
+        """段落前の余白も縮小される"""
+        self._fill_body(gen_with_slide, 1, text="あ" * 400)
+        target = gen_with_slide.current_body.paragraphs[0]
+        target.space_before = Pt(10)
+
+        auto_shrink_text(gen_with_slide.current_slide)
+        assert target.space_before.pt < 10
+
     def test_none_slide_is_noop(self):
         """スライドが None でも例外にならない"""
         auto_shrink_text(None)
@@ -1114,20 +1158,35 @@ class TestEstimateLineCount:
 
 
 class TestEstimateHeight:
-    def _para(self, text, size=10, level=0, spacing=1.0, space_after=0.0):
-        return ParagraphMetrics(text, size, level, spacing, space_after)
+    def _para(self, text, size=10, level=0, spacing=1.0, space_after=0.0, space_before=0.0):
+        return ParagraphMetrics(text, size, level, spacing, space_after, space_before)
 
     def test_single_line_height(self):
-        """1行の高さは フォントサイズ × 行送り"""
-        assert estimate_height_pt([self._para("あ", spacing=1.2)], 500) == pytest.approx(12.0)
+        """1行の高さは フォントサイズ × フォントの行高 × 行送り"""
+        # 10pt × 1.3(行高) × 1.2(行送り) = 15.6pt
+        assert estimate_height_pt([self._para("あ", spacing=1.2)], 500) == pytest.approx(15.6)
+
+    def test_line_height_exceeds_font_size(self):
+        """行の高さはフォントサイズそのものではなく、フォントの行高を考慮する
+
+        ここを 1.0 とみなしていた頃は必要な高さを約3割過小評価し、
+        本文がスライドからはみ出していた。
+        """
+        height = estimate_height_pt([self._para("あ", size=10, spacing=1.0)], 500)
+        assert height > 10
+        assert height == pytest.approx(10 * text_metrics.LINE_HEIGHT_RATIO)
 
     def test_wrapped_lines_are_counted(self):
         """折り返した行数ぶんの高さになる"""
         # 全角30文字 × 10pt = 300pt を 100pt 幅 → 3行
-        assert estimate_height_pt([self._para("あ" * 30)], 100) == pytest.approx(30.0)
+        assert estimate_height_pt([self._para("あ" * 30)], 100) == pytest.approx(39.0)
 
     def test_space_after_is_included(self):
-        assert estimate_height_pt([self._para("あ", space_after=5.0)], 500) == pytest.approx(15.0)
+        assert estimate_height_pt([self._para("あ", space_after=5.0)], 500) == pytest.approx(18.0)
+
+    def test_space_before_is_included(self):
+        """段落前の余白（h3見出しなどが使う）も高さに含める"""
+        assert estimate_height_pt([self._para("あ", space_before=10.0)], 500) == pytest.approx(23.0)
 
     def test_indent_reduces_available_width(self):
         """箇条書きのレベルが深いほど幅が狭まり、行数が増える"""
