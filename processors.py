@@ -1,11 +1,19 @@
+"""Markdown（HTML）の各タグをスライド上の要素へ変換する処理"""
+
+from __future__ import annotations
+
 import requests
 from io import BytesIO
 import zlib
 import base64
+from typing import TYPE_CHECKING, cast
+
+from bs4 import Tag
 from pptx.util import Inches
 from pptx.dml.color import RGBColor
 
 from utils import (
+    ImageSource,
     apply_font_style,
     insert_image_fit,
     shrink_body_shape,
@@ -15,6 +23,9 @@ from utils import (
     auto_shrink_text
 )
 
+if TYPE_CHECKING:
+    from generator import PPTXGenerator
+
 # 外部API（画像取得・Mermaid変換）のタイムアウト秒数
 HTTP_TIMEOUT_SEC = 15
 
@@ -22,7 +33,7 @@ HTTP_TIMEOUT_SEC = 15
 KROKI_MERMAID_PNG_URL = "https://kroki.io/mermaid/png/"
 MERMAID_INK_URL = "https://mermaid.ink/img/"
 
-def process_heading(generator, tag):
+def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     """見出しタグの処理とスライド作成"""
     if generator.current_slide:
         auto_shrink_text(generator.current_slide)
@@ -57,7 +68,7 @@ def process_heading(generator, tag):
         except Exception:
             pass
 
-def process_h3(generator, tag):
+def process_h3(generator: PPTXGenerator, tag: Tag) -> None:
     """H3見出し（スライド内セクション区切り）の処理"""
     if not tag.get_text(strip=True): return
     from pptx.util import Pt
@@ -84,7 +95,7 @@ def process_h3(generator, tag):
         p.font.size = Pt(font_conf['size_pt'])
     generator.slide_has_text = True
 
-def process_hr(generator, tag):
+def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
     """水平線（---）による新しいスライド（タイトルなし）の生成"""
     if generator.current_slide:
         from utils import auto_shrink_text
@@ -116,13 +127,13 @@ def process_hr(generator, tag):
         except Exception:
             pass
 
-def process_blockquote(generator, tag):
+def process_blockquote(generator: PPTXGenerator, tag: Tag) -> None:
     """スピーカーノートの処理"""
     text_frame = generator.current_slide.notes_slide.notes_text_frame
     note_text = tag.get_text(strip=True)
     text_frame.text = text_frame.text + "\n\n" + note_text if text_frame.text else note_text
 
-def load_image(src):
+def load_image(src: str) -> ImageSource:
     """画像URLならダウンロードし、ローカルパスならそのまま返す"""
     if src.startswith(('http://', 'https://')):
         response = requests.get(src, timeout=HTTP_TIMEOUT_SEC)
@@ -130,7 +141,7 @@ def load_image(src):
         return BytesIO(response.content)
     return src
 
-def process_image(generator, tag):
+def process_image(generator: PPTXGenerator, tag: Tag) -> None:
     """画像の挿入処理"""
     img_url = tag.get('src')
     if not img_url:
@@ -138,7 +149,7 @@ def process_image(generator, tag):
         return
 
     try:
-        img_data = load_image(img_url)
+        img_data = load_image(cast(str, img_url))
         pos = generator.images_conf.get('position_inches')
         
         if pos and len(pos) >= 2:
@@ -156,7 +167,7 @@ def process_image(generator, tag):
     except Exception as e:
         print(f"Warning: 画像の挿入に失敗しました: {e}")
 
-def process_table(generator, tag):
+def process_table(generator: PPTXGenerator, tag: Tag) -> None:
     """表の挿入処理"""
     rows = tag.find_all('tr')
     if not rows: return
@@ -191,7 +202,7 @@ def process_table(generator, tag):
                 add_runs_from_tag(generator, col, p, font_conf)
     generator.slide_has_text = True
 
-def render_mermaid(text):
+def render_mermaid(text: str) -> requests.Response:
     """Mermaid記法をPNG画像に変換する（Kroki優先、失敗時はmermaid.inkにフォールバック）"""
     compressed = zlib.compress(text.encode('utf-8'), 9)
     encoded = base64.urlsafe_b64encode(compressed).decode('ascii')
@@ -207,11 +218,13 @@ def render_mermaid(text):
 
     return response
 
-def process_code_or_mermaid(generator, tag):
+def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
     """コードブロックまたはMermaid図形の処理"""
     code_tag = tag.find('code')
     # class属性が無いコードブロックでは get('class') が None を返すため、必ず空リストへ倒す
-    classes = (code_tag.get('class') or []) if code_tag else []
+    classes: list[str] = cast(
+        "list[str]", (code_tag.get('class') or []) if isinstance(code_tag, Tag) else []
+    )
     is_mermaid = 'language-mermaid' in classes or 'mermaid' in classes
 
     language = None
@@ -220,7 +233,7 @@ def process_code_or_mermaid(generator, tag):
             language = cls.replace('language-', '')
             break
 
-    if is_mermaid:
+    if is_mermaid and isinstance(code_tag, Tag):
         try:
             print("INFO: Mermaid図形をAPIで生成中...")
             response = render_mermaid(code_tag.get_text())
@@ -236,7 +249,7 @@ def process_code_or_mermaid(generator, tag):
         append_code_textbox(generator, tag.get_text(), language=language)
         # generator.slide_has_text は append_code_textbox 内で True になります
 
-def process_text(generator, tag):
+def process_text(generator: PPTXGenerator, tag: Tag) -> None:
     """段落・リストの処理"""
     if not tag.get_text(strip=True): return
     
