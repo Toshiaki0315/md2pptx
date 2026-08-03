@@ -10,6 +10,7 @@ from pptx import Presentation
 from pptx.util import Inches
 import markdown
 from bs4 import BeautifulSoup, Comment, Tag
+from layout import SlideLayout
 from utils import FontConfig, apply_font_style
 
 from processors import (
@@ -36,6 +37,9 @@ class PPTXGenerator:
         self.fonts_conf: dict[str, FontConfig] = self.config.get('fonts') or {}
         self.images_conf: dict[str, Any] = self.config.get('images') or {}
 
+        # スライドサイズから導出した配置寸法（_init_presentation で設定）
+        self.layout: SlideLayout = None  # type: ignore[assignment]
+
         # python-pptx のオブジェクト群（型が動的なため Any で保持する）
         self.prs: Any = None
         self.current_slide: Any = None
@@ -55,6 +59,9 @@ class PPTXGenerator:
             width, height = self._get_slide_size(self.slides_conf.get('layout', '16:9'))
             self.prs.slide_width = width
             self.prs.slide_height = height
+
+        # 画像・表・コード枠の配置は、この寸法を基準に決める
+        self.layout = SlideLayout.from_presentation(self.prs)
 
     def _get_slide_size(self, layout_str: str) -> tuple[int, int]:
         sizes = {
