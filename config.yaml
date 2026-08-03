@@ -14,6 +14,31 @@ slides:
   # スライド番号の表示（右下）
   show_slide_number: true
 
+# --- Mermaid図の生成方法 ---
+# ⚠ 図のソースには社内システムの構成やデータフローが含まれ得ます。
+#    既定の "kroki" は外部の公開サービスへ図の内容を送信します。
+mermaid:
+  # kroki : Kroki で画像化する（endpoint を変えれば自己ホストも可能）
+  # local : mermaid-cli (mmdc) でオフライン生成する（外部送信なし）
+  #         要インストール: npm install -g @mermaid-js/mermaid-cli
+  # off   : Mermaid図を生成しない
+  renderer: "kroki"
+
+  # Krokiのエンドポイント。社内に自己ホストしたKrokiを指定すれば情報は外部に出ません。
+  # 例: "http://kroki.internal.example.com"
+  endpoint: "https://kroki.io"
+
+  # 公開サービスへ送信する際に警告を表示する
+  warn_on_external: true
+
+  # Kroki障害時に公開API(mermaid.ink)へフォールバックするか。
+  # 未指定の場合は「公開エンドポイントを使っているときのみ許可」します。
+  # 自己ホストを指定している場合に true にすると、障害時に図が外部へ送信されるので注意。
+  # fallback_to_public: false
+
+  # renderer: local のときに使うコマンド
+  # cli_path: "mmdc"
+
 # --- カラーテーマの一括設定 ---
 theme:
   accent_color: [0, 112, 192]   # 見出し・テーブルヘッダーの基本色
