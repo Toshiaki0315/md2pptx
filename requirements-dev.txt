@@ -1,0 +1,18 @@
+# 開発（テスト・型チェック）に必要なライブラリ
+#
+#   pip install -r requirements-dev.txt
+#
+# 実行用の依存も含めて導入されます。
+
+-r requirements.txt
+
+pytest>=8.0
+pytest-cov>=5.0
+pytest-mock>=3.12
+mypy>=1.10
+
+# サードパーティ製ライブラリの型スタブ
+# 導入すると mypy がより厳密にチェックできます
+types-requests
+types-PyYAML
+types-Markdown

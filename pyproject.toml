@@ -1,0 +1,29 @@
+# md2pptx はパッケージとして配布せず、スクリプトとして実行する構成のため、
+# このファイルは開発ツールの設定置き場として使用する。
+# 依存関係は requirements.txt / requirements-dev.txt を参照。
+
+[tool.pytest.ini_options]
+# `pytest` だけでカバレッジまで計測する
+addopts = "--cov --cov-report=term-missing"
+
+[tool.coverage.run]
+source = [
+    "md2pptx",
+    "generator",
+    "processors",
+    "utils",
+    "layout",
+    "text_metrics",
+    "mermaid_renderer",
+]
+
+[tool.mypy]
+# サードパーティ製ライブラリの型スタブは任意導入とし、
+# 未導入の環境でも型チェックを実行できるようにする
+ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
+
+[[tool.mypy.overrides]]
+# テストコードはモックを多用するため、型チェックの対象外とする
+module = "test_md2pptx"
+ignore_errors = true

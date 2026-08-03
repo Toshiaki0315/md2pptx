@@ -23,10 +23,15 @@ Markdownファイルから美しいPowerPoint（.pptx）スライドを自動生
 
 ## 📦 動作環境とインストール
 
-Python 3.x 環境が必要です。以下の外部ライブラリをインストールしてください。
+Python 3.x 環境が必要です。依存ライブラリは `requirements.txt` にまとめています。
 
 ```bash
-pip install python-pptx markdown beautifulsoup4 requests PyYAML Pygments
+pip install -r requirements.txt
+```
+
+仮想環境を使う場合:
+```bash
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 ```
 
 ## 🚀 使い方
@@ -46,33 +51,24 @@ python md2pptx.py input.md -o output.pptx -c config.yaml
 
 本プロジェクトでは品質維持のため、`pytest` によるユニットテストを導入しています。
 
-### 1. テスト用ライブラリのインストール
+### 1. 開発用ライブラリのインストール
+テスト・型チェックに必要なものは `requirements-dev.txt` にまとめています（実行用の依存も含みます）。
 ```bash
-pip install pytest pytest-cov pytest-mock
+pip install -r requirements-dev.txt
 ```
 
-### 2. テストの実行
-すべてのテストを実行するには以下のコマンドを使用します。
+### 2. テストとカバレッジの計測
 ```bash
 pytest
 ```
+カバレッジの計測は `pyproject.toml` で既定に設定してあるため、`pytest` だけで網羅率まで表示されます。
 
-### 3. カバレッジ（網羅率）の計測
-コードの何割がテストされているかを確認し、レポートを表示します。
-```bash
-pytest --cov=md2pptx --cov=generator --cov=processors --cov=utils --cov=mermaid_renderer --cov=layout --cov=text_metrics --cov-report=term-missing
-```
 現在のカバレッジは **99%**（231テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
 
-### 4. 型チェック（mypy）
-全モジュールに型アノテーションを付与しています。設定は `mypy.ini` にあります。
+### 3. 型チェック（mypy）
+全モジュールに型アノテーションを付与しています。設定は `pyproject.toml` の `[tool.mypy]` にあります。
 ```bash
-pip install mypy
 mypy .
-```
-サードパーティ製ライブラリの型スタブは任意です。導入するとより厳密にチェックできます。
-```bash
-pip install types-requests types-PyYAML types-Markdown
 ```
 
 ## 📝 Markdownの書き方とスライドへの反映
