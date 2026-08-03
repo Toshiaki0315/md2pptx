@@ -1,0 +1,17 @@
+# md2pptx の実行に必要なライブラリ
+#
+#   pip install -r requirements.txt
+#
+# 下限のみを指定しています。CI などで環境を完全に固定したい場合は
+# `pip freeze > requirements.lock.txt` で固定版を別途生成してください。
+
+python-pptx>=1.0
+Markdown>=3.5
+beautifulsoup4>=4.12
+requests>=2.31
+PyYAML>=6.0
+Pygments>=2.17
+
+# 画像の縮小に PIL を直接使用しているため、
+# python-pptx の推移的依存に頼らず明示する
+Pillow>=10.0
