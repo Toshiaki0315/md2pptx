@@ -13,6 +13,7 @@ from pptx.dml.color import RGBColor
 from mermaid_renderer import mermaid_conf, render_mermaid
 from utils import (
     DEFAULT_IMAGE_DPI,
+    FontConfig,
     ImageSource,
     apply_font_style,
     downscale_image,
@@ -20,7 +21,7 @@ from utils import (
     shrink_body_shape,
     add_runs_from_tag,
     append_text_block,
-    append_code_textbox,
+    create_code_textbox,
     auto_shrink_text
 )
 
@@ -29,6 +30,10 @@ if TYPE_CHECKING:
 
 # 画像取得（HTTP）のタイムアウト秒数
 HTTP_TIMEOUT_SEC = 15
+
+# config.yaml に該当設定が無い場合のコードブロックの既定値
+DEFAULT_CODE_BLOCK_FONT = {'name': 'Consolas', 'size_pt': 12}
+DEFAULT_CODE_BG_COLOR = [40, 44, 52]
 
 def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     """見出しタグの処理とスライド作成"""
@@ -130,6 +135,37 @@ def process_blockquote(generator: PPTXGenerator, tag: Tag) -> None:
     note_text = tag.get_text(strip=True)
     text_frame.text = text_frame.text + "\n\n" + note_text if text_frame.text else note_text
 
+def inline_code_conf(generator: PPTXGenerator) -> FontConfig | None:
+    """インラインコード（`code`）のフォント設定を取り出す"""
+    return generator.fonts_conf.get('inline_code')
+
+def append_code_textbox(
+    generator: PPTXGenerator, content: str, language: str | None = None
+) -> None:
+    """レイアウトを決めて、背景色付きのコード枠をスライドに追加する"""
+    layout = generator.layout
+
+    if generator.slide_has_text or generator.forced_layout == '2-column':
+        shrink_body_shape(generator.current_slide, layout.code_split_body_width)
+        box = (layout.code_split_left, layout.content_top,
+               layout.code_split_width, layout.content_height)
+    elif generator.forced_layout == 'center':
+        box = (layout.code_center_left, layout.content_top,
+               layout.code_center_width, layout.content_height)
+    else:
+        box = (layout.content_left, layout.code_full_top,
+               layout.content_width, layout.code_full_height)
+
+    theme = generator.config.get('theme') or {}
+    create_code_textbox(
+        generator.current_slide, *box,
+        content=content,
+        language=language,
+        font_conf=generator.fonts_conf.get('code_block', DEFAULT_CODE_BLOCK_FONT),
+        background_rgb=theme.get('code_bg_color', DEFAULT_CODE_BG_COLOR),
+    )
+    generator.slide_has_text = True
+
 def image_dpi(generator: PPTXGenerator) -> int | None:
     """埋め込み画像の解像度を返す（images.downscale が false の場合は None＝縮小しない）"""
     if not generator.images_conf.get('downscale', True):
@@ -161,7 +197,7 @@ def place_image_full(generator: PPTXGenerator, img_data: ImageSource) -> None:
 def place_image_split(generator: PPTXGenerator, img_data: ImageSource) -> None:
     """本文枠を左に縮め、図を右半分に配置する（2カラム）"""
     layout = generator.layout
-    shrink_body_shape(generator, layout.split_body_width)
+    shrink_body_shape(generator.current_slide, layout.split_body_width)
     place_image(
         generator, img_data,
         layout.split_image_left, layout.content_top,
@@ -216,7 +252,9 @@ def process_table(generator: PPTXGenerator, tag: Tag) -> None:
     
     if generator.slide_has_text:
         shrink_body_shape(
-            generator, layout.content_width, max_height=layout.table_split_body_height
+            generator.current_slide,
+            layout.content_width,
+            max_height=layout.table_split_body_height,
         )
         table_top = layout.table_split_top
     else:
@@ -243,7 +281,7 @@ def process_table(generator: PPTXGenerator, tag: Tag) -> None:
                 else:
                     font_conf = generator.fonts_conf.get('table_body', {'name': 'Meiryo', 'size_pt': 12})
                     
-                add_runs_from_tag(generator, col, p, font_conf)
+                add_runs_from_tag(col, p, font_conf, inline_code_conf(generator))
     generator.slide_has_text = True
 
 def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
@@ -276,7 +314,6 @@ def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
             print(f"Warning: Mermaid図形の生成に失敗しました: {e}")
     else:
         append_code_textbox(generator, tag.get_text(), language=language)
-        # generator.slide_has_text は append_code_textbox 内で True になります
 
 def process_text(generator: PPTXGenerator, tag: Tag) -> None:
     """段落・リストの処理"""
@@ -285,5 +322,11 @@ def process_text(generator: PPTXGenerator, tag: Tag) -> None:
     level = min(len(tag.find_parents(['ul', 'ol'])) - 1, 8) if tag.name == 'li' else 0
     font_conf = generator.fonts_conf.get(f'bullet_level_{level + 1}' if tag.name == 'li' else 'body', generator.fonts_conf.get('body'))
     
-    append_text_block(generator, tag, level=level, font_conf=font_conf)
+    append_text_block(
+        generator.current_body, tag,
+        reuse_first_paragraph=not generator.slide_has_text,
+        level=level,
+        font_conf=font_conf,
+        inline_code_conf=inline_code_conf(generator),
+    )
     generator.slide_has_text = True

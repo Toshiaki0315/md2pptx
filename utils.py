@@ -1,4 +1,9 @@
-"""描画・レイアウトのヘルパー関数群"""
+"""描画のヘルパー関数群
+
+このモジュールは PPTXGenerator に依存しない純粋なヘルパーのみを置く。
+スライドや設定を引数で受け取り、ジェネレーターの状態は参照しない。
+ジェネレーターの状態に依存する処理は processors.py 側に置くこと。
+"""
 
 from __future__ import annotations
 
@@ -26,9 +31,7 @@ from pygments.styles import get_style_by_name
 if TYPE_CHECKING:
     from pptx.shapes.picture import Picture
     from pptx.slide import Slide
-    from pptx.text.text import _Paragraph, _Run
-
-    from generator import PPTXGenerator
+    from pptx.text.text import TextFrame, _Paragraph, _Run
 
 #: config.yaml のフォント設定（name / size_pt / bold / color_rgb）
 FontConfig = dict[str, Any]
@@ -41,6 +44,14 @@ DEFAULT_IMAGE_DPI = 150
 
 #: JPEGを再エンコードする際の品質
 JPEG_QUALITY = 90
+
+#: インラインコードの既定フォント・色（config.yaml に inline_code が無い場合）
+DEFAULT_INLINE_CODE_FONT = 'Consolas'
+DEFAULT_INLINE_CODE_COLOR = [220, 20, 60]
+
+#: コードブロック枠の内側の余白と行送り
+CODE_BOX_MARGIN_INCHES = 0.2
+CODE_BOX_LINE_SPACING = 1.1
 
 
 def hex_to_rgb(hex_str: str | None) -> RGBColor | None:
@@ -177,12 +188,14 @@ def insert_image_fit(
     return pic
 
 def add_runs_from_tag(
-    generator: PPTXGenerator,
     element: Tag,
     paragraph: _Paragraph,
     default_font_conf: FontConfig | None,
+    inline_code_conf: FontConfig | None = None,
 ) -> None:
     """インライン装飾を解釈しながらテキストを追加（再帰処理）"""
+    code_conf = inline_code_conf or {}
+
     for child in element:
         if isinstance(child, NavigableString):
             text = str(child).replace('\n', ' ')
@@ -193,7 +206,7 @@ def add_runs_from_tag(
         elif isinstance(child, Tag):
             if child.name in ['ul', 'ol', 'pre', 'img', 'table', 'blockquote']: continue
             if child.name in ['p', 'div', 'span', 'li', 'th', 'td']:
-                add_runs_from_tag(generator, child, paragraph, default_font_conf)
+                add_runs_from_tag(child, paragraph, default_font_conf, inline_code_conf)
             else:
                 run = paragraph.add_run()
                 run.text = child.get_text().replace('\n', ' ')
@@ -202,12 +215,12 @@ def add_runs_from_tag(
                 if child.name in ['strong', 'b']: run.font.bold = True
                 elif child.name in ['em', 'i']: run.font.italic = True
                 elif child.name == 'code':
-                    run.font.name = generator.fonts_conf.get('inline_code', {}).get('name', 'Consolas')
-                    rgb = generator.fonts_conf.get('inline_code', {}).get('color_rgb', [220, 20, 60])
+                    run.font.name = code_conf.get('name', DEFAULT_INLINE_CODE_FONT)
+                    rgb = code_conf.get('color_rgb', DEFAULT_INLINE_CODE_COLOR)
                     run.font.color.rgb = RGBColor(rgb[0], rgb[1], rgb[2])
 
 def shrink_body_shape(
-    generator: PPTXGenerator,
+    slide: Slide,
     width: Length,
     max_height: Length | None = None,
 ) -> None:
@@ -218,7 +231,7 @@ def shrink_body_shape(
     残りの値が 0 になる。継承値を明示的に書き戻してから変更する必要がある。
     """
     try:
-        body_shape = generator.current_slide.placeholders[1]
+        body_shape = slide.placeholders[1]
         body_shape.left, body_shape.top = body_shape.left, body_shape.top
         body_shape.width = width
         if max_height:
@@ -227,65 +240,57 @@ def shrink_body_shape(
         pass
 
 def append_text_block(
-    generator: PPTXGenerator,
+    text_frame: TextFrame,
     content: Tag,
+    reuse_first_paragraph: bool = False,
     level: int = 0,
     font_conf: FontConfig | None = None,
+    inline_code_conf: FontConfig | None = None,
 ) -> None:
-    """段落オブジェクトを追加し、テキストまたはタグ構造を書き込むヘルパー"""
-    if not generator.slide_has_text and len(generator.current_body.paragraphs) == 1 and not generator.current_body.paragraphs[0].text:
-        p = generator.current_body.paragraphs[0]
+    """段落オブジェクトを追加し、テキストまたはタグ構造を書き込むヘルパー
+
+    reuse_first_paragraph が真で、かつ枠が空のときは、既存の空段落を再利用する
+    （先頭に空行が入るのを避けるため）。
+    """
+    is_empty = len(text_frame.paragraphs) == 1 and not text_frame.paragraphs[0].text
+    if reuse_first_paragraph and is_empty:
+        p = text_frame.paragraphs[0]
     else:
-        p = generator.current_body.add_paragraph()
+        p = text_frame.add_paragraph()
 
     p.level = level
     p.space_after = Pt(12)  # 段落後の余白を追加してレイアウトを美しく
     p.line_spacing = 1.2    # 行間を1.2倍に設定
 
-    add_runs_from_tag(generator, content, p, font_conf)
+    add_runs_from_tag(content, p, font_conf, inline_code_conf)
 
-def append_code_textbox(
-    generator: PPTXGenerator, content: str, language: str | None = None
+def create_code_textbox(
+    slide: Slide,
+    left: Length,
+    top: Length,
+    width: Length,
+    height: Length,
+    content: str,
+    language: str | None,
+    font_conf: FontConfig | None,
+    background_rgb: list[int],
 ) -> None:
-    """独立したテキストボックスを作成し、背景色付きでコードを挿入する"""
-    layout = generator.layout
-    if generator.slide_has_text or generator.forced_layout == '2-column':
-        shrink_body_shape(generator, layout.code_split_body_width)
-        box_left = layout.code_split_left
-        box_top = layout.content_top
-        box_width = layout.code_split_width
-        box_height = layout.content_height
-    elif generator.forced_layout == 'center':
-        box_left = layout.code_center_left
-        box_top = layout.content_top
-        box_width = layout.code_center_width
-        box_height = layout.content_height
-    else:
-        box_left = layout.content_left
-        box_top = layout.code_full_top
-        box_width = layout.content_width
-        box_height = layout.code_full_height
-
-    textbox = generator.current_slide.shapes.add_textbox(box_left, box_top, box_width, box_height)
+    """背景色付きのテキストボックスを作り、コードをハイライトして書き込む"""
+    textbox = slide.shapes.add_textbox(left, top, width, height)
     textbox.fill.solid()
-
-    bg_color = generator.config.get('theme', {}).get('code_bg_color', [40, 44, 52]) if hasattr(generator, 'config') else [40, 44, 52]
-    textbox.fill.fore_color.rgb = RGBColor(*bg_color)
+    textbox.fill.fore_color.rgb = RGBColor(*background_rgb)
 
     tf = textbox.text_frame
     tf.word_wrap = True
-    tf.margin_left = Inches(0.2)
-    tf.margin_top = Inches(0.2)
-    tf.margin_right = Inches(0.2)
-    tf.margin_bottom = Inches(0.2)
+    tf.margin_left = Inches(CODE_BOX_MARGIN_INCHES)
+    tf.margin_top = Inches(CODE_BOX_MARGIN_INCHES)
+    tf.margin_right = Inches(CODE_BOX_MARGIN_INCHES)
+    tf.margin_bottom = Inches(CODE_BOX_MARGIN_INCHES)
 
     p = tf.paragraphs[0]
-    p.line_spacing = 1.1
+    p.line_spacing = CODE_BOX_LINE_SPACING
 
-    conf = generator.fonts_conf.get('code_block', {'name': 'Consolas', 'size_pt': 12})
-    apply_syntax_highlight(p, content, language, conf)
-
-    generator.slide_has_text = True
+    apply_syntax_highlight(p, content, language, font_conf)
 
 def _paragraph_metrics(paragraph: _Paragraph) -> ParagraphMetrics:
     """段落から高さ概算に必要な情報を取り出す"""
