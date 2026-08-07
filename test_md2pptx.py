@@ -31,6 +31,11 @@ from generator import PPTXGenerator
 from layout import SlideLayout
 from text_metrics import (
     ParagraphMetrics,
+    TableRowMetrics,
+    estimate_row_heights_pt,
+    estimate_table_height_pt,
+    fit_table_scale,
+    paginate_row_heights,
     char_width_ratio,
     estimate_height_pt,
     estimate_line_count,
@@ -1024,6 +1029,80 @@ class TestProcessTable:
         shape = [s for s in gen_with_slide.current_slide.shapes if s.has_table][0]
         assert shape.top == Inches(1.5)
 
+    def _long_table(self, data_rows):
+        body = "\n".join(f"| 項目{i} | 値{i} |" for i in range(data_rows))
+        return f"| 見出しA | 見出しB |\n|---|---|\n{body}"
+
+    def _tables_of(self, gen):
+        return [
+            (i, s) for i, slide in enumerate(gen.prs.slides)
+            for s in slide.shapes if s.has_table
+        ]
+
+    def test_row_heights_are_explicit(self, gen_with_slide):
+        """行の高さを明示する
+
+        既定では総高さを行数で均等割りするため、行数が多いと1行あたりが
+        極端に小さくなり、PowerPointが描画時に押し広げてはみ出していた。
+        """
+        process_table(gen_with_slide, parse_md(self._long_table(3)).find("table"))
+        table = self._tables_of(gen_with_slide)[0][1].table
+
+        # 12pt の本文なら 0.2インチ程度では収まらない
+        assert all(row.height > Inches(0.25) for row in table.rows)
+
+    def test_long_table_is_split_across_slides(self, gen_with_slide, capsys):
+        """1枚に収まらない表は複数スライドに分割される"""
+        process_table(gen_with_slide, parse_md(self._long_table(40)).find("table"))
+
+        tables = self._tables_of(gen_with_slide)
+        assert len(tables) > 1
+        assert "分割しました" in capsys.readouterr().out
+
+    def test_split_pages_stay_inside_the_slide(self, gen_with_slide):
+        """分割後はどのページもスライドからはみ出さない"""
+        process_table(gen_with_slide, parse_md(self._long_table(40)).find("table"))
+
+        for _, shape in self._tables_of(gen_with_slide):
+            bottom = shape.top + sum(row.height for row in shape.table.rows)
+            assert bottom <= gen_with_slide.prs.slide_height
+
+    def test_header_is_repeated_on_continuation_slides(self, gen_with_slide):
+        """続きのスライドにも見出し行が繰り返される"""
+        process_table(gen_with_slide, parse_md(self._long_table(40)).find("table"))
+
+        for _, shape in self._tables_of(gen_with_slide):
+            assert shape.table.cell(0, 0).text == "見出しA"
+
+    def test_continuation_slide_title(self, gen_with_slide):
+        """続きのスライドのタイトルには「（続き）」が付く"""
+        process_table(gen_with_slide, parse_md(self._long_table(40)).find("table"))
+
+        titles = [s.shapes.title.text for s in gen_with_slide.prs.slides]
+        assert titles[0] == "見出し"
+        assert titles[1] == "見出し（続き）"
+        # 「（続き）（続き）」のように重ならない
+        assert all(t.count("（続き）") <= 1 for t in titles)
+
+    def test_short_table_is_not_split(self, gen_with_slide):
+        """収まる表は分割しない"""
+        process_table(gen_with_slide, parse_md(self._long_table(3)).find("table"))
+        assert len(gen_with_slide.prs.slides) == 1
+
+    def test_font_is_shrunk_before_splitting(self, base_config):
+        """分割の前に、まず縮小で1枚に収めることを試みる"""
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+        process_table(gen, parse_md(self._long_table(12)).find("table"))
+
+        assert len(gen.prs.slides) == 1
+        table = self._tables_of(gen)[0][1].table
+        sizes = [
+            r.font.size.pt for row in table.rows for c in row.cells
+            for p in c.text_frame.paragraphs for r in p.runs if r.font.size
+        ]
+        assert min(sizes) < 12  # table_body の既定サイズより小さい
+
 
 class TestProcessCodeOrMermaid:
     def test_code_block_without_language_does_not_crash(self, gen_with_slide):
@@ -1278,6 +1357,77 @@ class TestEstimateHeight:
         assert estimate_height_pt(paragraphs, 100, scale=0.5) < estimate_height_pt(
             paragraphs, 100
         )
+
+
+class TestTableHeightEstimation:
+    """表の高さの概算と分割"""
+
+    def _rows(self, count, text="項目", size=12):
+        return [TableRowMetrics([text, text], size) for _ in range(count)]
+
+    def test_row_height_includes_margins(self):
+        """行の高さはフォントの行高にセルの上下マージンを加えたもの"""
+        (height,) = estimate_row_heights_pt(self._rows(1, size=10), 500, 7.2)
+        assert height == pytest.approx(10 * text_metrics.LINE_HEIGHT_RATIO + 7.2)
+
+    def test_wrapped_cell_makes_the_row_taller(self):
+        """折り返すセルがある行はその分高くなる"""
+        narrow = estimate_row_heights_pt([TableRowMetrics(["あ" * 30], 10)], 100, 0)
+        wide = estimate_row_heights_pt([TableRowMetrics(["あ" * 30], 10)], 500, 0)
+        assert narrow[0] > wide[0]
+
+    def test_total_height_is_the_sum_of_rows(self):
+        rows = self._rows(4)
+        assert estimate_table_height_pt(rows, 500, 7.2) == pytest.approx(
+            sum(estimate_row_heights_pt(rows, 500, 7.2))
+        )
+
+    def test_scale_shrinks_a_tall_table(self):
+        """1枚に収まらない表は縮小率が1.0未満になる"""
+        assert fit_table_scale(self._rows(30), 500, 7.2, 200) < 1.0
+
+    def test_no_shrink_when_it_fits(self):
+        assert fit_table_scale(self._rows(2), 500, 7.2, 1000) == 1.0
+
+    def test_empty_table_needs_no_shrink(self):
+        assert fit_table_scale([], 500, 7.2, 100) == 1.0
+
+
+class TestPaginateRows:
+    """表の行をページに分割する"""
+
+    def test_single_page_when_it_fits(self):
+        assert paginate_row_heights([10, 10, 10], 100) == [[0, 1, 2]]
+
+    def test_splits_when_overflowing(self):
+        assert paginate_row_heights([10, 10, 10, 10], 25) == [[0, 1], [2, 3]]
+
+    def test_header_is_repeated_on_each_page(self):
+        """見出し行は各ページの先頭に繰り返される"""
+        pages = paginate_row_heights([10, 10, 10, 10, 10], 25, repeat_first_row=True)
+
+        assert pages == [[0, 1], [0, 2], [0, 3], [0, 4]]
+        assert all(page[0] == 0 for page in pages)
+
+    def test_header_height_is_reserved_on_every_page(self):
+        """繰り返す見出し行の高さも各ページの消費として数える
+
+        枠20pt・行10pt の場合、見出しを繰り返すとデータは1ページ1行しか入らない。
+        """
+        assert paginate_row_heights([10, 10, 10, 10], 20) == [[0, 1], [2, 3]]
+        assert paginate_row_heights([10, 10, 10, 10], 20, repeat_first_row=True) == [
+            [0, 1], [0, 2], [0, 3]
+        ]
+
+    def test_oversized_row_still_gets_a_page(self):
+        """1行だけで枠を超える場合でも、そのページに載せる（無限分割の防止）"""
+        assert paginate_row_heights([100, 100], 10) == [[0], [1]]
+
+    @pytest.mark.parametrize("heights, available", [([], 100), ([10], 0)])
+    def test_degenerate_cases(self, heights, available):
+        """行が無い、または高さが取れない場合も破綻しない"""
+        pages = paginate_row_heights(heights, available)
+        assert pages == ([] if not heights else [[0]])
 
 
 class TestFitScale:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 
 #: 全角として扱う East Asian Width の区分（W=Wide, F=Fullwidth, A=Ambiguous）
@@ -96,6 +97,28 @@ def estimate_height_pt(
     return total
 
 
+def _search_scale(
+    measure: Callable[[float], float],
+    available_height_pt: float,
+    minimum: float,
+    step: float,
+) -> float:
+    """measure(縮小率) が枠に収まる最大の縮小率を段階的に探す
+
+    フォントを縮めると行の高さだけでなく折り返し行数も減るため、
+    必要な縮小率は単純な比では求まらない。
+    """
+    if available_height_pt <= 0:
+        return 1.0
+
+    scale = 1.0
+    while scale > minimum:
+        if measure(scale) <= available_height_pt:
+            return scale
+        scale = round(scale - step, 4)
+    return minimum
+
+
 def fit_scale(
     paragraphs: list[ParagraphMetrics],
     available_width_pt: float,
@@ -103,17 +126,110 @@ def fit_scale(
     minimum: float = MIN_SHRINK_SCALE,
     step: float = SHRINK_STEP,
 ) -> float:
-    """枠に収まる最大の縮小率（1.0=縮小不要）を返す
-
-    フォントを縮めると行の高さだけでなく折り返し行数も減るため、
-    必要な縮小率は単純な比では求まらない。段階的に試して収まる値を採用する。
-    """
-    if available_height_pt <= 0 or not paragraphs:
+    """枠に収まる最大の縮小率（1.0=縮小不要）を返す"""
+    if not paragraphs:
         return 1.0
+    return _search_scale(
+        lambda scale: estimate_height_pt(paragraphs, available_width_pt, scale),
+        available_height_pt,
+        minimum,
+        step,
+    )
 
-    scale = 1.0
-    while scale > minimum:
-        if estimate_height_pt(paragraphs, available_width_pt, scale) <= available_height_pt:
-            return scale
-        scale = round(scale - step, 4)
-    return minimum
+
+@dataclass(frozen=True)
+class TableRowMetrics:
+    """高さの概算に必要な、表1行ぶんの情報"""
+
+    texts: list[str]
+    font_size_pt: float
+
+
+def estimate_row_heights_pt(
+    rows: list[TableRowMetrics],
+    column_width_pt: float,
+    vertical_margin_pt: float,
+    scale: float = 1.0,
+) -> list[float]:
+    """表の各行に必要な高さ（ポイント）を概算する
+
+    セルの内容が折り返す場合はその行数ぶん高くなる。
+    """
+    heights = []
+    for row in rows:
+        font_size = row.font_size_pt * scale
+        lines = max(
+            (estimate_line_count(text, font_size, column_width_pt) for text in row.texts),
+            default=1,
+        )
+        heights.append(lines * font_size * LINE_HEIGHT_RATIO + vertical_margin_pt)
+    return heights
+
+
+def estimate_table_height_pt(
+    rows: list[TableRowMetrics],
+    column_width_pt: float,
+    vertical_margin_pt: float,
+    scale: float = 1.0,
+) -> float:
+    """表全体の高さ（ポイント）を概算する"""
+    return sum(estimate_row_heights_pt(rows, column_width_pt, vertical_margin_pt, scale))
+
+
+def paginate_row_heights(
+    row_heights: list[float],
+    available_height_pt: float,
+    repeat_first_row: bool = False,
+) -> list[list[int]]:
+    """表の行を、枠に収まるページ単位のインデックス列に分割する
+
+    repeat_first_row が真の場合、2ページ目以降の先頭に1行目（見出し行）を繰り返し、
+    その高さも各ページの消費として数える。
+    1行が単独で枠を超える場合でも、そのページには必ず1行は載せる（無限分割の防止）。
+    """
+    if not row_heights:
+        return []
+
+    data_start = 1 if repeat_first_row else 0
+    if available_height_pt <= 0 or len(row_heights) <= data_start:
+        return [list(range(len(row_heights)))]
+
+    header_height = row_heights[0] if repeat_first_row else 0.0
+    pages: list[list[int]] = []
+    current: list[int] = []
+    used = header_height
+
+    for index in range(data_start, len(row_heights)):
+        height = row_heights[index]
+        if current and used + height > available_height_pt:
+            pages.append(current)
+            current = []
+            used = header_height
+        current.append(index)
+        used += height
+
+    if current:
+        pages.append(current)
+
+    if repeat_first_row:
+        return [[0] + page for page in pages]
+    return pages
+
+
+def fit_table_scale(
+    rows: list[TableRowMetrics],
+    column_width_pt: float,
+    vertical_margin_pt: float,
+    available_height_pt: float,
+    minimum: float = MIN_SHRINK_SCALE,
+    step: float = SHRINK_STEP,
+) -> float:
+    """表が枠に収まる最大の縮小率（1.0=縮小不要）を返す"""
+    if not rows:
+        return 1.0
+    return _search_scale(
+        lambda scale: estimate_table_height_pt(rows, column_width_pt, vertical_margin_pt, scale),
+        available_height_pt,
+        minimum,
+        step,
+    )
