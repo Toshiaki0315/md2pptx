@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import markdown
 import pytest
+import yaml
 from PIL import Image
 from bs4 import BeautifulSoup
 from pptx import Presentation
@@ -28,6 +29,7 @@ import mermaid_renderer
 import processors
 import utils
 import text_metrics
+from config_schema import validate_config
 from generator import PPTXGenerator
 from layout import SlideLayout
 from text_metrics import (
@@ -2102,6 +2104,172 @@ print(1)
 # =====================================================================
 
 
+class TestConfigValidation:
+    """config.yaml の検証"""
+
+    def _errors(self, config):
+        return validate_config(config).errors
+
+    def _warnings(self, config):
+        return validate_config(config).warnings
+
+    def test_valid_config_passes(self):
+        """同梱の config.yaml は警告もエラーも出ない"""
+        config = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+        result = validate_config(config)
+
+        assert result.errors == []
+        assert result.warnings == []
+
+    @pytest.mark.parametrize("config", [None, {}])
+    def test_empty_config_is_valid(self, config):
+        """設定が空でも既定値で動くため、エラーにはしない"""
+        assert validate_config(config).is_valid
+
+    def test_non_mapping_is_rejected(self):
+        """最上位がマッピングでない場合はエラーにする"""
+        assert "最上位" in self._errors(["slides"])[0]
+
+    # --- 型の誤り ---
+
+    def test_size_must_be_a_number(self):
+        """文字列のサイズ指定を分かりやすく指摘する
+
+        従来は python-pptx まで届き
+        「Exceeds the limit (4300 digits) for integer string conversion」
+        という、設定ミスとは読み取れない例外になっていた。
+        """
+        (error,) = self._errors({"fonts": {"body": {"size_pt": "20"}}})
+        assert "fonts.body.size_pt" in error
+        assert "数値で指定" in error
+
+    @pytest.mark.parametrize("size", [0, -5])
+    def test_size_must_be_positive(self, size):
+        (error,) = self._errors({"fonts": {"body": {"size_pt": size}}})
+        assert "0より大きい" in error
+
+    def test_bold_must_be_boolean(self):
+        (error,) = self._errors({"fonts": {"body": {"bold": "yes"}}})
+        assert "true か false" in error
+
+    @pytest.mark.parametrize(
+        "color, expected",
+        [
+            ([10, 20], "3つの値が必要"),
+            ("#0070C0", "[赤, 緑, 青]"),
+            ([300, 0, 0], "0〜255"),
+            ([0, "x", 0], "整数で指定"),
+        ],
+    )
+    def test_color_validation(self, color, expected):
+        """色指定の誤りを、どの成分が悪いかまで含めて指摘する"""
+        (error,) = self._errors({"fonts": {"body": {"color_rgb": color}}})
+        assert expected in error
+
+    def test_theme_color_validation(self):
+        """テーマ色も同じ基準で検証する"""
+        (error,) = self._errors({"theme": {"accent_color": "#0070C0"}})
+        assert "theme.accent_color" in error
+
+    def test_image_settings(self):
+        errors = self._errors({"images": {"dpi": "high", "downscale": "yes"}})
+        assert len(errors) == 2
+
+    @pytest.mark.parametrize("position", [[1.0], "5.2, 1.8", [1.0, "x"]])
+    def test_position_inches_validation(self, position):
+        (error,) = self._errors({"images": {"position_inches": position}})
+        assert "images.position_inches" in error
+
+    def test_mermaid_renderer_choices(self):
+        """選択肢の誤りは、正しい候補を添えて指摘する"""
+        (error,) = self._errors({"mermaid": {"renderer": "kroky"}})
+        assert "kroki / local / off" in error
+        assert "'kroki' の誤りではありませんか？" in error
+
+    def test_nested_value_must_be_a_mapping(self):
+        (error,) = self._errors({"slides": "16:9"})
+        assert "入れ子" in error
+
+    # --- 綴り違いの警告（従来は黙って無視されていた） ---
+
+    def test_unknown_top_level_key_suggests_correction(self):
+        (warning,) = self._warnings({"font": {}})
+        assert "'fonts' の誤りではありませんか？" in warning
+
+    def test_unknown_font_key_suggests_correction(self):
+        (warning,) = self._warnings({"fonts": {"bodyy": {"size_pt": 18}}})
+        assert "'body' の誤りではありませんか？" in warning
+
+    def test_unknown_font_field_suggests_correction(self):
+        (warning,) = self._warnings({"fonts": {"body": {"sise_pt": 18}}})
+        assert "'size_pt' の誤りではありませんか？" in warning
+
+    def test_bullet_levels_are_accepted(self):
+        """bullet_level_N は任意の階層を指定できる"""
+        config = {"fonts": {f"bullet_level_{n}": {"size_pt": 18} for n in range(1, 6)}}
+        assert validate_config(config).warnings == []
+
+    def test_unknown_layout_warns_about_fallback(self):
+        """未対応の画角は、代わりに使われる値まで示す"""
+        (warning,) = self._warnings({"slides": {"layout": "16:9ワイド"}})
+        assert "16:9 が使われます" in warning
+
+    def test_unrelated_key_warns_without_suggestion(self):
+        """似た候補が無い場合は候補を出さない"""
+        (warning,) = self._warnings({"まったく無関係": 1})
+        assert "誤りではありませんか" not in warning
+
+    @pytest.mark.parametrize(
+        "config, path",
+        [
+            ({"slides": {"template_path": 123}}, "slides.template_path"),
+            ({"mermaid": {"endpoint": 123}}, "mermaid.endpoint"),
+            ({"mermaid": {"cli_path": []}}, "mermaid.cli_path"),
+            ({"fonts": {"body": {"name": 123}}}, "fonts.body.name"),
+        ],
+    )
+    def test_string_fields(self, config, path):
+        """文字列を期待する項目に他の型を書いた場合を指摘する"""
+        (error,) = self._errors(config)
+        assert path in error
+        assert "文字列で指定" in error
+
+    @pytest.mark.parametrize(
+        "section", ["slides", "fonts", "images", "theme", "mermaid"]
+    )
+    def test_empty_section_is_accepted(self, section):
+        """セクションを書いて中身が空（None）でも既定値で動くため許容する"""
+        assert validate_config({section: None}).is_valid
+
+    @pytest.mark.parametrize(
+        "config", [
+            {"fonts": "Meiryo"},
+            {"fonts": {"body": "Meiryo"}},
+            {"images": "3.5"},
+            {"theme": "dark"},
+            {"mermaid": "kroki"},
+        ],
+    )
+    def test_sections_must_be_mappings(self, config):
+        """セクションの値がマッピングでない場合を指摘する"""
+        (error,) = self._errors(config)
+        assert "入れ子" in error
+
+    def test_boolean_mermaid_flags(self):
+        errors = self._errors(
+            {"mermaid": {"warn_on_external": "yes", "fallback_to_public": 1}}
+        )
+        assert len(errors) == 2
+
+    def test_all_problems_are_reported_at_once(self):
+        """1件目で止めず、まとめて指摘する"""
+        config = {
+            "fonts": {"body": {"size_pt": "20"}, "title_h1": {"color_rgb": [300, 0, 0]}},
+            "images": {"dpi": "high"},
+        }
+        assert len(self._errors(config)) == 3
+
+
 class TestApplyTheme:
     def test_accent_and_text_colors(self):
         """テーマ色が見出し系・本文系のフォント設定に展開される"""
@@ -2199,6 +2367,30 @@ class TestCli:
 
         assert main([md, "-o", out, "-c", conf]) == 0
         assert spy.call_args[0][0]["fonts"]["title_h1"]["color_rgb"] == [1, 2, 3]
+
+    def test_main_rejects_invalid_config(self, tmp_path, capsys):
+        """設定に誤りがあれば、変換を始める前に中止する"""
+        md, _, out = self._write_project(tmp_path)
+        conf = tmp_path / "bad.yaml"
+        conf.write_text('fonts:\n  body:\n    size_pt: "20"\n', encoding="utf-8")
+
+        assert main([md, "-o", out, "-c", str(conf)]) == 1
+
+        captured = capsys.readouterr().out
+        assert "fonts.body.size_pt" in captured
+        assert "数値で指定" in captured
+        assert not os.path.exists(out)  # 途中まで書き出さない
+
+    def test_main_warns_but_continues(self, tmp_path, capsys):
+        """警告のみの場合は指摘したうえで変換を続ける"""
+        md, _, out = self._write_project(tmp_path)
+        conf = tmp_path / "typo.yaml"
+        conf.write_text("font:\n  body:\n    size_pt: 20\n", encoding="utf-8")
+
+        assert main([md, "-o", out, "-c", str(conf)]) == 0
+
+        assert "'fonts' の誤りではありませんか？" in capsys.readouterr().out
+        assert os.path.exists(out)
 
     def test_main_uses_sys_argv_by_default(self, tmp_path, mocker):
         """引数を渡さない場合はsys.argvを解析する"""

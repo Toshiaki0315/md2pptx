@@ -15,6 +15,7 @@ source = [
     "layout",
     "text_metrics",
     "mermaid_renderer",
+    "config_schema",
 ]
 
 [tool.mypy]
