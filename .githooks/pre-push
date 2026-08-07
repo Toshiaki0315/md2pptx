@@ -1,0 +1,11 @@
+#!/bin/sh
+#
+# push前にテストと型チェックを実行し、失敗したらpushを中止する。
+#
+# 有効化（クローンごとに1度だけ）:
+#   git config core.hooksPath .githooks
+#
+# 一時的に飛ばしたい場合:
+#   git push --no-verify
+
+exec "$(dirname "$0")/../scripts/check.sh"

@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同じブランチで新しい実行が始まったら、進行中の実行は打ち切る
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: テスト・型チェック (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: 依存関係のインストール
+        run: pip install -r requirements-dev.txt
+
+      # ローカルの pre-push フックと同じスクリプトを使い、
+      # 手元とCIで結果が食い違わないようにする
+      - name: テストと型チェック
+        run: sh scripts/check.sh
+
+  sample:
+    name: サンプルの変換
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 依存関係のインストール
+        run: pip install -r requirements.txt
+
+      # Mermaidは外部APIに依存し、CIを不安定にするため無効化して変換する
+      - name: sample.md を変換
+        run: |
+          sed 's/^  renderer: "kroki"/  renderer: "off"/' config.yaml > ci-config.yaml
+          python md2pptx.py sample.md -o sample.pptx -c ci-config.yaml
+
+      - name: 生成されたPPTXを成果物として保存
+        uses: actions/upload-artifact@v4
+        with:
+          name: sample-pptx
+          path: sample.pptx
+          retention-days: 14
