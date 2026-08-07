@@ -22,7 +22,10 @@ Markdownファイルから美しいPowerPoint（.pptx）スライドを自動生
   * 箇条書きレベルや要素ごとのフォント設定が可能。
   * Markdown先頭にYAMLフロントマターを記述し、タイトルスライドを自動生成可能。
 * **レイアウトの強制指定**
-  * `<!-- layout: 2-column -->` や `<!-- layout: center -->` などのHTMLコメントにより、スライドレイアウトを自由に上書き指定できます。
+  * `<!-- layout: 2-column -->` `<!-- layout: center -->` `<!-- layout: full-image -->` などのHTMLコメントにより、スライドレイアウトを上書き指定できます。
+  * `<!-- layout: dark-theme -->` でそのスライドだけ暗い配色にできます（配置指定と併記可能）。
+* **フッターの自動挿入**
+  * 日付・任意の文言・ページ番号をスライド下部に自動挿入します。
 
 ## 📦 動作環境とインストール
 
@@ -66,7 +69,7 @@ pytest
 ```
 カバレッジの計測は `pyproject.toml` で既定に設定してあるため、`pytest` だけで網羅率まで表示されます。
 
-現在のカバレッジは **99%**（351テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
+現在のカバレッジは **99%**（378テスト）です。外部API（Kroki / mermaid.ink）やHTTP画像取得、mermaid-cli の呼び出しはすべてモック化しているため、テスト実行時にネットワーク接続や追加ツールは不要です。
 
 ### 3. 型チェック（mypy）
 全モジュールに型アノテーションを付与しています。設定は `pyproject.toml` の `[tool.mypy]` にあります。
@@ -236,6 +239,39 @@ mermaid:
 ```bash
 npm install -g @mermaid-js/mermaid-cli
 ```
+
+### 8. レイアウトの強制指定（HTMLコメント）
+スライドごとに配置や配色を上書きできます。**カンマ区切りで併記**できます。
+
+```markdown
+## 図を大きく見せるスライド
+<!-- layout: full-image, dark-theme -->
+
+![システム構成](architecture.png)
+```
+
+| 指定 | 内容 |
+| :--- | :--- |
+| `2-column` | テキストが無くても図・表を右半分に配置 |
+| `center` | 図をコンテンツ領域の中央に配置 |
+| `full-image` | 図をスライド全面に配置（余白なし） |
+| `dark-theme` | そのスライドだけ背景を暗く、文字を明るくする |
+
+`dark-theme` は配置とは別軸なので、`2-column` などと併記できます。配色は `config.yaml` の `theme.dark_background_color` / `theme.dark_text_color` で変更できます。
+
+### 9. フッター（日付・文言・ページ番号）
+スライド下部に、PowerPointの慣習どおり**左に日付・中央に文言・右にページ番号**を挿入します。
+
+```yaml
+slides:
+  show_slide_number: true    # ページ番号（右下）
+  footer:
+    text: "社外秘 - DX推進チーム"   # 中央に出す文言
+    date: true                     # true=変換日 / 文字列=その値をそのまま表示
+    show_on_title: false           # 表紙にも出すか
+```
+
+表紙にはページ番号を振りません（本編を1ページ目として数えます）。書式は `fonts.footer` で変更できます。
 
 ## ⚙️ 設定ファイル (`config.yaml`)
 

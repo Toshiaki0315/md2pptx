@@ -9,6 +9,7 @@
 
 import base64
 import os
+from datetime import datetime
 import subprocess
 from io import BytesIO
 from pathlib import Path
@@ -2286,6 +2287,185 @@ class TestLayoutComments:
         assert gen.forced_layout is None
 
 
+class TestFooter:
+    """日付・文言・ページ番号のフッター"""
+
+    MD = "# 表紙\n\n## 2枚目\n\n## 3枚目\n"
+
+    def _generate(self, base_config, tmp_path, footer=None, show_number=True):
+        base_config["slides"]["show_slide_number"] = show_number
+        if footer is not None:
+            base_config["slides"]["footer"] = footer
+        gen = PPTXGenerator(base_config)
+        gen.generate(self.MD, str(tmp_path / "out.pptx"))
+        return gen
+
+    def _texts(self, slide):
+        return [s.text_frame.text for s in textboxes_of(slide) if s.text_frame.text]
+
+    def test_footer_parts_are_placed(self, base_config, tmp_path):
+        """左に日付、中央に文言、右にページ番号を置く（PowerPointの慣習）"""
+        gen = self._generate(
+            base_config, tmp_path, {"text": "社外秘", "date": "2026年5月10日"}
+        )
+        boxes = sorted(textboxes_of(gen.prs.slides[1]), key=lambda s: s.left)
+
+        assert [b.text_frame.text for b in boxes] == ["2026年5月10日", "社外秘", "1"]
+
+    def test_date_true_uses_the_conversion_date(self, base_config, tmp_path):
+        """date: true は変換した日付を表示する"""
+        gen = self._generate(base_config, tmp_path, {"date": True})
+
+        expected = datetime.now().strftime("%Y-%m-%d")
+        assert expected in self._texts(gen.prs.slides[1])
+
+    def test_title_slide_is_excluded_by_default(self, base_config, tmp_path):
+        """既定では表紙にフッターを出さない"""
+        gen = self._generate(base_config, tmp_path, {"text": "社外秘"})
+        assert self._texts(gen.prs.slides[0]) == []
+
+    def test_show_on_title(self, base_config, tmp_path):
+        """show_on_title で表紙にも文言・日付を出せる"""
+        gen = self._generate(
+            base_config, tmp_path, {"text": "社外秘", "show_on_title": True}
+        )
+        assert self._texts(gen.prs.slides[0]) == ["社外秘"]
+
+    def test_title_slide_has_no_page_number(self, base_config, tmp_path):
+        """表紙にはページ番号を振らない（本編を1ページ目として数える）"""
+        gen = self._generate(
+            base_config, tmp_path, {"text": "社外秘", "show_on_title": True}
+        )
+
+        assert "0" not in self._texts(gen.prs.slides[0])
+        assert "1" in self._texts(gen.prs.slides[1])
+
+    def test_no_footer_settings_adds_nothing_extra(self, base_config, tmp_path):
+        """フッター設定が無ければページ番号だけになる（従来どおり）"""
+        gen = self._generate(base_config, tmp_path)
+        assert self._texts(gen.prs.slides[1]) == ["1"]
+
+    def test_everything_disabled(self, base_config, tmp_path):
+        """番号もフッターも無効なら何も追加しない"""
+        gen = self._generate(base_config, tmp_path, {}, show_number=False)
+        assert self._texts(gen.prs.slides[1]) == []
+
+    def test_font_can_be_configured(self, base_config, tmp_path):
+        """fonts.footer で書式を変えられる"""
+        base_config["fonts"]["footer"] = {"size_pt": 9, "color_rgb": [1, 2, 3]}
+        gen = self._generate(base_config, tmp_path, {"text": "社外秘"})
+
+        run = textboxes_of(gen.prs.slides[1])[0].text_frame.paragraphs[0].runs[0]
+        assert run.font.size == Pt(9)
+        assert run.font.color.rgb == RGBColor(1, 2, 3)
+
+    @pytest.mark.parametrize(
+        "setting, expected", [(True, None), ("2026年5月10日", "2026年5月10日"), (False, ""), (None, "")]
+    )
+    def test_footer_date_text(self, setting, expected):
+        """日付の指定の解釈"""
+        actual = processors.footer_date_text(setting)
+        assert actual == (datetime.now().strftime("%Y-%m-%d") if expected is None else expected)
+
+
+class TestDarkTheme:
+    """<!-- layout: dark-theme --> による配色の切り替え"""
+
+    def _generate(self, gen, tmp_path, md):
+        gen.generate(md, str(tmp_path / "out.pptx"))
+        return gen.prs.slides[0]
+
+    def test_background_and_text_are_inverted(self, gen, tmp_path):
+        """背景が暗くなり、タイトルと本文の文字が明るくなる"""
+        slide = self._generate(
+            gen, tmp_path, "## 暗いスライド\n<!-- layout: dark-theme -->\n\n本文\n"
+        )
+
+        assert slide.background.fill.fore_color.rgb == RGBColor(30, 30, 30)
+        for shape in slide.shapes:
+            if shape.is_placeholder and shape.has_text_frame:
+                for p in shape.text_frame.paragraphs:
+                    for run in p.runs:
+                        assert run.font.color.rgb == RGBColor(240, 240, 240)
+
+    def test_colors_can_be_configured(self, base_config, tmp_path):
+        """theme で配色を変えられる"""
+        base_config["theme"] = {
+            "dark_background_color": [1, 2, 3], "dark_text_color": [4, 5, 6],
+        }
+        gen = PPTXGenerator(base_config)
+        slide = self._generate(gen, tmp_path, "## 暗い\n<!-- layout: dark-theme -->\n\n本文\n")
+
+        assert slide.background.fill.fore_color.rgb == RGBColor(1, 2, 3)
+
+    def test_can_be_combined_with_a_placement(self, gen, tmp_path, png_file):
+        """配置の指定と併用できる（配色とは別軸のため）"""
+        md = f"## 併用\n<!-- layout: 2-column, dark-theme -->\n\n本文\n\n![図]({png_file})\n"
+        slide = self._generate(gen, tmp_path, md)
+
+        assert gen.forced_layout == "2-column"
+        assert slide.background.fill.fore_color.rgb == RGBColor(30, 30, 30)
+
+    def test_applies_only_to_the_marked_slide(self, gen, tmp_path):
+        """指定したスライドだけが対象になる"""
+        gen.generate(
+            "## 暗い\n<!-- layout: dark-theme -->\n\n本文\n\n## 通常\n本文\n",
+            str(tmp_path / "out.pptx"),
+        )
+
+        assert gen.prs.slides[0].background.fill.type is not None
+        assert gen.dark_slide is False  # 次のスライドでリセットされる
+
+    def test_unknown_directive_warns(self, gen, tmp_path, capsys):
+        """未知の指定は警告して無視する"""
+        gen.generate("## 見出し\n<!-- layout: fancy-mode -->\n\n本文\n", str(tmp_path / "o.pptx"))
+        assert "不明なレイアウト指定" in capsys.readouterr().out
+
+    def test_empty_directive_is_ignored(self, gen, tmp_path, capsys):
+        """区切りだけの指定（余分なカンマ）は黙って読み飛ばす"""
+        gen.generate("## 見出し\n<!-- layout: center, -->\n\n本文\n", str(tmp_path / "o.pptx"))
+
+        assert gen.forced_layout == "center"
+        assert "不明なレイアウト指定" not in capsys.readouterr().out
+
+    def test_without_a_slide_is_noop(self, gen):
+        """スライドが無い状態でダークテーマを適用しても落ちない"""
+        processors.apply_dark_theme(gen)
+
+
+class TestFullImageLayout:
+    """<!-- layout: full-image --> による全面配置"""
+
+    def test_image_covers_the_slide(self, gen, tmp_path, png_file):
+        """余白を取らずスライドいっぱいに広げる"""
+        gen.generate(
+            f"## 全面\n<!-- layout: full-image -->\n\n![図]({png_file})\n",
+            str(tmp_path / "out.pptx"),
+        )
+        picture = [
+            s for s in gen.prs.slides[0].shapes
+            if s.shape_type is not None and "PICTURE" in str(s.shape_type)
+        ][0]
+
+        # 縦横比を保つため、片方の軸はスライド全体に一致する
+        fills_width = picture.width == gen.prs.slide_width
+        fills_height = picture.height == gen.prs.slide_height
+        assert fills_width or fills_height
+        assert picture.left >= 0 and picture.top >= 0
+
+    def test_multiple_images_share_the_whole_slide(self, gen, tmp_path, png_file):
+        """複数枚でもスライド全体を使って並べる"""
+        md = f"## 全面\n<!-- layout: full-image -->\n\n![a]({png_file})\n\n![b]({png_file})\n"
+        gen.generate(md, str(tmp_path / "out.pptx"))
+
+        pictures = [
+            s for s in gen.prs.slides[0].shapes
+            if s.shape_type is not None and "PICTURE" in str(s.shape_type)
+        ]
+        assert len(pictures) == 2
+        assert min(p.left for p in pictures) < gen.layout.content_left
+
+
 class TestSlideNumbers:
     def test_numbers_are_added_except_first_slide(self, base_config, tmp_path):
         """先頭スライドを除いてページ番号が挿入される"""
@@ -2528,6 +2708,32 @@ class TestConfigValidation:
         """bullet_level_N は任意の階層を指定できる"""
         config = {"fonts": {f"bullet_level_{n}": {"size_pt": 18} for n in range(1, 6)}}
         assert validate_config(config).warnings == []
+
+    @pytest.mark.parametrize(
+        "footer, expected",
+        [
+            ({"text": 123}, "文字列で指定"),
+            ({"show_on_title": "yes"}, "true か false"),
+            ({"date": 123}, "true（変換日を表示）"),
+        ],
+    )
+    def test_footer_validation(self, footer, expected):
+        """フッター設定の型の誤りを指摘する"""
+        (error,) = self._errors({"slides": {"footer": footer}})
+        assert expected in error
+
+    def test_footer_must_be_a_mapping(self):
+        (error,) = self._errors({"slides": {"footer": "社外秘"}})
+        assert "入れ子" in error
+
+    def test_footer_unknown_key(self):
+        (warning,) = self._warnings({"slides": {"footer": {"txt": "a"}}})
+        assert "'text' の誤りではありませんか？" in warning
+
+    def test_dark_theme_colors_are_validated(self):
+        """ダークテーマの配色も色として検証される"""
+        (error,) = self._errors({"theme": {"dark_background_color": "#000000"}})
+        assert "theme.dark_background_color" in error
 
     def test_h3_as_choices(self):
         """h3_as の選択肢の誤りを候補付きで指摘する"""
