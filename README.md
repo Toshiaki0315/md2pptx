@@ -1,5 +1,7 @@
 # md2pptx - Markdown to PowerPoint Converter
 
+[![CI](https://github.com/Toshiaki0315/md2pptx/actions/workflows/ci.yml/badge.svg)](https://github.com/Toshiaki0315/md2pptx/actions/workflows/ci.yml)
+
 Markdownファイルから美しいPowerPoint（.pptx）スライドを自動生成するPythonスクリプトです。
 技術資料、要件定義書、プロジェクト提案書などをテキストベースで素早く作成し、デザインの微調整にかかる時間を大幅に削減します。
 
@@ -98,6 +100,13 @@ Success: no issues found in 8 source files
 ```bash
 PYTHON=.venv/bin/python sh scripts/check.sh
 ```
+
+### 6. CI（GitHub Actions）
+push と Pull Request のたびに、**Python 3.11 / 3.12 / 3.13** でテストと型チェックが自動実行されます（`.github/workflows/ci.yml`）。
+
+CIはローカルの `scripts/check.sh` をそのまま実行するため、**手元とCIで結果が食い違いません**。
+
+あわせて `sample.md` の変換を実行し、生成された `sample.pptx` を成果物（Artifacts）として保存します。実行結果の画面からダウンロードして、実際の見た目を確認できます。
 
 ## 📝 Markdownの書き方とスライドへの反映
 
