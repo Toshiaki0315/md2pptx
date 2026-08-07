@@ -815,6 +815,77 @@ class TestProcessHeading:
         assert gen.current_slide.shapes.title.text == "中身"
 
 
+class TestH3AsSlide:
+    """slides.h3_as による h3 の扱いの切り替え"""
+
+    MD = "## 現状の課題\n本文です。\n\n### システムの老朽化\n* 動作が遅い\n\n### 情報共有\n* タイムラグ\n"
+
+    def _generate(self, base_config, tmp_path, h3_as=None):
+        if h3_as is not None:
+            base_config["slides"]["h3_as"] = h3_as
+        gen = PPTXGenerator(base_config)
+        gen.generate(self.MD, str(tmp_path / "out.pptx"))
+        return gen
+
+    @pytest.mark.parametrize("h3_as", [None, "subheading"])
+    def test_default_is_subheading(self, base_config, tmp_path, h3_as):
+        """既定ではスライド内の小見出しとして扱う（従来の挙動）"""
+        gen = self._generate(base_config, tmp_path, h3_as)
+
+        assert len(gen.prs.slides) == 1
+        assert "システムの老朽化" in gen.current_body.text
+
+    def test_slide_mode_creates_new_slides(self, base_config, tmp_path):
+        """h3_as: slide では h3 ごとに新しいスライドを作る"""
+        gen = self._generate(base_config, tmp_path, "slide")
+
+        titles = [s.shapes.title.text for s in gen.prs.slides]
+        assert titles == ["現状の課題", "システムの老朽化", "情報共有"]
+
+    def test_slide_mode_uses_the_content_layout(self, base_config, tmp_path):
+        """h3から作られるスライドは h2 と同じコンテンツ用レイアウトを使う"""
+        gen = self._generate(base_config, tmp_path, "slide")
+
+        assert gen.prs.slides[1].slide_layout == gen.prs.slide_layouts[1]
+
+    def test_slide_mode_moves_content_to_the_new_slide(self, base_config, tmp_path):
+        """h3の後の本文は、その h3 のスライドに入る"""
+        gen = self._generate(base_config, tmp_path, "slide")
+
+        bodies = [s.placeholders[1].text_frame.text for s in gen.prs.slides]
+        assert bodies[0] == "本文です。"
+        assert bodies[1] == "動作が遅い"
+
+    def test_setting_is_case_insensitive(self, base_config, tmp_path):
+        """大文字で書かれていても解釈する"""
+        gen = self._generate(base_config, tmp_path, "SLIDE")
+        assert len(gen.prs.slides) == 3
+
+    def test_layout_comment_is_reset_on_new_slide(self, base_config, tmp_path):
+        """h3でスライドが変わるとき、直前のレイアウト指定は引き継がない"""
+        base_config["slides"]["h3_as"] = "slide"
+        gen = PPTXGenerator(base_config)
+        gen.generate("## 見出し\n\n<!-- layout: center -->\n\n### 次のスライド\n", str(tmp_path / "o.pptx"))
+
+        assert gen.forced_layout is None
+
+    def test_h3_before_any_heading(self, base_config, tmp_path):
+        """先頭が h3 でも、slide 指定ならスライドが作られる"""
+        base_config["slides"]["h3_as"] = "slide"
+        gen = PPTXGenerator(base_config)
+        gen.generate("### いきなり見出し\n本文\n", str(tmp_path / "o.pptx"))
+
+        assert len(gen.prs.slides) == 1
+        assert gen.prs.slides[0].shapes.title.text == "いきなり見出し"
+
+    def test_h3_before_any_heading_is_ignored_as_subheading(self, base_config, tmp_path):
+        """小見出しモードでは、配置先が無い h3 は無視する"""
+        gen = PPTXGenerator(base_config)
+        gen.generate("### いきなり見出し\n", str(tmp_path / "o.pptx"))
+
+        assert len(gen.prs.slides) == 0
+
+
 class TestProcessH3:
     BU_NONE = "{http://schemas.openxmlformats.org/drawingml/2006/main}buNone"
 
@@ -1605,6 +1676,17 @@ class TestSlideLayout:
         assert gen.layout.content_top == body.top
         assert gen.layout.content_width == body.width
 
+    def test_template_without_body_placeholder(self):
+        """本文プレースホルダーを持たないテンプレートでは既定値にフォールバックする"""
+        prs = MagicMock()
+        prs.slide_width, prs.slide_height = Inches(10), Inches(5.625)
+        prs.slide_layouts.__getitem__.side_effect = KeyError("placeholder なし")
+
+        layout = SlideLayout.from_presentation(prs)
+
+        assert layout.content_left == Inches(0.5)
+        assert layout.content_top == Inches(1.75)
+
     # --- 整合性 ---
 
     def test_full_width_and_split_share_the_right_edge(self):
@@ -2261,6 +2343,12 @@ class TestConfigValidation:
         """bullet_level_N は任意の階層を指定できる"""
         config = {"fonts": {f"bullet_level_{n}": {"size_pt": 18} for n in range(1, 6)}}
         assert validate_config(config).warnings == []
+
+    def test_h3_as_choices(self):
+        """h3_as の選択肢の誤りを候補付きで指摘する"""
+        (error,) = self._errors({"slides": {"h3_as": "slides"}})
+        assert "subheading / slide" in error
+        assert "'slide' の誤りではありませんか？" in error
 
     def test_unknown_layout_warns_about_fallback(self):
         """未対応の画角は、代わりに使われる値まで示す"""

@@ -151,7 +151,8 @@ class PPTXGenerator:
             if tag.name in ['h1', 'h2']:
                 self.forced_layout = None # 新しいスライドでリセット
                 process_heading(self, tag)
-            elif tag.name == 'h3' and self.current_body:
+            elif tag.name == 'h3':
+                # 新規スライドにするか小見出しにするかは process_h3 が設定を見て判断する
                 process_h3(self, tag)
             elif tag.name == 'hr':
                 self.forced_layout = None
