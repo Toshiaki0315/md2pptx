@@ -71,6 +71,34 @@ pytest
 mypy .
 ```
 
+### 4. まとめてチェックする
+テストと型チェックをまとめて実行します。片方が失敗しても両方の結果を表示します。
+```bash
+sh scripts/check.sh
+```
+
+### 5. push前の自動チェック
+CIの代わりに、**push時に上記のチェックを自動実行**できます。クローンごとに1度だけ以下を設定してください。
+```bash
+git config core.hooksPath .githooks
+```
+
+以降、`git push` のたびにテストと型チェックが走り、**失敗するとpushが中止されます**。
+
+```
+==> テスト (pytest)
+267 passed
+==> 型チェック (mypy)
+Success: no issues found in 8 source files
+すべてのチェックを通過しました。
+```
+
+急ぐ場合は `git push --no-verify` でスキップできます。
+仮想環境のPythonを明示したい場合は `PYTHON` で指定できます。
+```bash
+PYTHON=.venv/bin/python sh scripts/check.sh
+```
+
 ## 📝 Markdownの書き方とスライドへの反映
 
 ### 1. スライドの生成とレイアウト
