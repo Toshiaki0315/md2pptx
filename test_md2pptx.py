@@ -1821,6 +1821,30 @@ print(1)
         assert gen.current_body.text == ""
         assert gen.current_slide.notes_slide.notes_text_frame.text == "ノート"
 
+    def test_blockquote_list_is_not_duplicated(self, gen, tmp_path):
+        """引用内の箇条書きが本文に漏れ出さない
+
+        除外条件が p だけだった頃は、ノートに書いた箇条書きが
+        スライド本文にもそのまま出力されていた。
+        """
+        md = "# タイトル\n\n> 発表のポイント\n>\n> * 最初に結論を述べる\n> * 質問は最後に受ける\n"
+        gen.generate(md, str(tmp_path / "out.pptx"))
+
+        assert gen.current_body.text == ""
+        notes = gen.current_slide.notes_slide.notes_text_frame.text
+        assert notes == "発表のポイント\n最初に結論を述べる\n質問は最後に受ける"
+
+    @pytest.mark.parametrize(
+        "content", ["| A | B |\n> |---|---|\n> | 1 | 2 |", "```\ncode\n```"]
+    )
+    def test_other_blocks_in_blockquote_stay_in_notes(self, gen, tmp_path, content):
+        """引用内の表やコードブロックも本文には出力されない"""
+        quoted = "\n".join(f"> {line}" for line in content.split("\n"))
+        gen.generate(f"# タイトル\n\n> 前置き\n>\n{quoted}\n", str(tmp_path / "out.pptx"))
+
+        assert gen.current_body.text == ""
+        assert len(gen.current_slide.shapes) == 2  # タイトルと本文のみ
+
     def test_hr_creates_additional_slide(self, gen, tmp_path):
         """水平線でスライドが追加される"""
         gen.generate("## 1枚目\n\n本文\n\n---\n\n続き\n", str(tmp_path / "out.pptx"))
