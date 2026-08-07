@@ -23,7 +23,7 @@ from typing import Any
 #: 最上位で認識するキー
 KNOWN_TOP_LEVEL = ('slides', 'fonts', 'images', 'theme', 'mermaid')
 
-KNOWN_SLIDES = ('template_path', 'layout', 'show_slide_number')
+KNOWN_SLIDES = ('template_path', 'layout', 'show_slide_number', 'h3_as')
 KNOWN_IMAGES = ('default_height_inches', 'position_inches', 'downscale', 'dpi')
 KNOWN_THEME = ('accent_color', 'text_color', 'code_bg_color')
 KNOWN_MERMAID = (
@@ -42,6 +42,7 @@ BULLET_LEVEL_PATTERN = re.compile(r'^bullet_level_\d+$')
 
 #: 選択肢が決まっている項目
 VALID_LAYOUTS = ('16:9', '4:3', '16:10', 'A4')
+VALID_H3_AS = ('subheading', 'slide')
 VALID_MERMAID_RENDERERS = ('kroki', 'local', 'off')
 
 
@@ -150,6 +151,14 @@ def _validate_slides(conf: Any, result: ValidationResult) -> None:
         _check_str('slides.template_path', conf['template_path'], result)
     if conf.get('show_slide_number') is not None:
         _check_bool('slides.show_slide_number', conf['show_slide_number'], result)
+    if conf.get('h3_as') is not None:
+        h3_as = conf['h3_as']
+        if h3_as not in VALID_H3_AS:
+            result.errors.append(
+                f"slides.h3_as: '{h3_as}' は指定できません"
+                f"（{' / '.join(VALID_H3_AS)} のいずれか）"
+                f"{_suggestion(str(h3_as), VALID_H3_AS)}"
+            )
 
 
 def _validate_fonts(conf: Any, result: ValidationResult) -> None:

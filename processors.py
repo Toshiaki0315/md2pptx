@@ -48,6 +48,10 @@ NOTE_BLOCK_TAGS = ['p', 'li']
 # 箇条書きのインデントレベルの上限（PowerPointの仕様）
 MAX_BULLET_LEVEL = 8
 
+# slides.h3_as に指定できる値。h3 をスライド内の小見出しにするか、新規スライドにするか
+H3_AS_SUBHEADING = 'subheading'
+H3_AS_SLIDE = 'slide'
+
 # config.yaml に該当設定が無い場合のコードブロックの既定値
 DEFAULT_CODE_BLOCK_FONT = {'name': 'Consolas', 'size_pt': 12}
 DEFAULT_CODE_BG_COLOR = [40, 44, 52]
@@ -114,9 +118,28 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
         except Exception:
             pass
 
+def h3_creates_slide(generator: PPTXGenerator) -> bool:
+    """h3 を新規スライドとして扱うか（config.yaml の slides.h3_as）"""
+    setting = generator.slides_conf.get('h3_as', H3_AS_SUBHEADING)
+    return str(setting).lower() == H3_AS_SLIDE
+
 def process_h3(generator: PPTXGenerator, tag: Tag) -> None:
-    """H3見出し（スライド内セクション区切り）の処理"""
+    """H3見出しの処理
+
+    既定ではスライド内の小見出しとして扱う。
+    slides.h3_as: "slide" を指定した場合は h2 と同じく新規スライドを作る。
+    """
     if not tag.get_text(strip=True): return
+
+    if h3_creates_slide(generator):
+        # 新しいスライドに移るので、直前のレイアウト指定は引き継がない
+        generator.forced_layout = None
+        process_heading(generator, tag)
+        return
+
+    if generator.current_body is None:
+        return  # 見出しより前に現れた h3 は配置先が無い
+
     from pptx.util import Pt
     
     p = generator.current_body.add_paragraph()
