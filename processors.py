@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import requests
 from io import BytesIO
 from typing import TYPE_CHECKING, cast
 
 from bs4 import BeautifulSoup, Tag
+from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Inches, Length, Pt
 from pptx.dml.color import RGBColor
 
@@ -24,6 +26,7 @@ from utils import (
     apply_font_style,
     downscale_image,
     insert_image_fit,
+    set_alt_text,
     shrink_body_shape,
     add_runs_from_tag,
     append_text_block,
@@ -32,6 +35,8 @@ from utils import (
 )
 
 if TYPE_CHECKING:
+    from pptx.shapes.picture import Picture
+
     from generator import PPTXGenerator
 
 # 画像取得（HTTP）のタイムアウト秒数
@@ -55,6 +60,13 @@ DEFAULT_TABLE_BODY_FONT: FontConfig = {'name': 'Meiryo', 'size_pt': 12}
 
 # 分割された表の続きスライドのタイトルに付ける接尾辞
 TABLE_CONTINUATION_SUFFIX = '（続き）'
+
+# Markdownの列揃え指定と PowerPoint の配置の対応
+CELL_ALIGNMENTS = {
+    'left': PP_ALIGN.LEFT,
+    'center': PP_ALIGN.CENTER,
+    'right': PP_ALIGN.RIGHT,
+}
 
 # python-pptx が設定するセルの既定マージン（ポイント）
 CELL_MARGIN_H_PT = 0.1 * 72
@@ -231,26 +243,26 @@ def place_image(
     top: Length,
     width: Length,
     height: Length,
-) -> None:
+) -> Picture:
     """設定に応じて画像を縮小したうえで、指定した枠に収めて配置する"""
     dpi = image_dpi(generator)
     if dpi:
         img_data = downscale_image(img_data, width, height, dpi)
-    insert_image_fit(generator.current_slide, img_data, left, top, width, height)
+    return insert_image_fit(generator.current_slide, img_data, left, top, width, height)
 
-def place_image_full(generator: PPTXGenerator, img_data: ImageSource) -> None:
+def place_image_full(generator: PPTXGenerator, img_data: ImageSource) -> Picture:
     """コンテンツ領域いっぱいに図を配置する"""
     layout = generator.layout
-    place_image(
+    return place_image(
         generator, img_data,
         layout.content_left, layout.content_top, layout.content_width, layout.content_height,
     )
 
-def place_image_split(generator: PPTXGenerator, img_data: ImageSource) -> None:
+def place_image_split(generator: PPTXGenerator, img_data: ImageSource) -> Picture:
     """本文枠を左に縮め、図を右半分に配置する（2カラム）"""
     layout = generator.layout
     shrink_body_shape(generator.current_slide, layout.split_body_width)
-    place_image(
+    return place_image(
         generator, img_data,
         layout.split_image_left, layout.content_top,
         layout.split_image_width, layout.content_height,
@@ -281,15 +293,20 @@ def process_image(generator: PPTXGenerator, tag: Tag) -> None:
             dpi = image_dpi(generator)
             if dpi:
                 img_data = downscale_image(img_data, generator.prs.slide_width, fixed_height, dpi)
-            generator.current_slide.shapes.add_picture(img_data, Inches(pos[0]), Inches(pos[1]), height=fixed_height)
+            picture = generator.current_slide.shapes.add_picture(
+                img_data, Inches(pos[0]), Inches(pos[1]), height=fixed_height
+            )
         elif generator.forced_layout == 'center':
-            place_image_full(generator, img_data)
+            picture = place_image_full(generator, img_data)
         else:
             # オートレイアウト
             if generator.slide_has_text or generator.forced_layout == '2-column':
-                place_image_split(generator, img_data)
+                picture = place_image_split(generator, img_data)
             else:
-                place_image_full(generator, img_data)
+                picture = place_image_full(generator, img_data)
+
+        # Markdownの代替テキスト（![説明](...) の「説明」）を引き継ぐ
+        set_alt_text(picture, str(tag.get('alt') or ''))
     except Exception as e:
         print(f"Warning: 画像の挿入に失敗しました: {e}")
 
@@ -298,6 +315,18 @@ def scaled_font(font_conf: FontConfig, scale: float) -> FontConfig:
     if scale >= 1.0 or 'size_pt' not in font_conf:
         return font_conf
     return {**font_conf, 'size_pt': max(1, int(font_conf['size_pt'] * scale))}
+
+def cell_alignment(cell: Tag) -> PP_ALIGN | None:
+    """Markdownの列揃え指定（`:---:` など）をPowerPointの配置に変換する
+
+    markdown拡張は `style="text-align: center;"` を、古い版は `align="center"` を出力する。
+    指定が無い場合は None を返し、PowerPoint側の既定に任せる。
+    """
+    value = cell.get('align')
+    if not value:
+        match = re.search(r'text-align:\s*(left|center|right)', str(cell.get('style') or ''))
+        value = match.group(1) if match else None
+    return CELL_ALIGNMENTS.get(str(value)) if value else None
 
 def table_row_metrics(
     rows: list[Tag], header_conf: FontConfig, body_conf: FontConfig
@@ -353,6 +382,7 @@ def render_table_page(
             cell = table.cell(row_idx, col_idx)
             cell.text = ""
             p = cell.text_frame.paragraphs[0]
+            p.alignment = cell_alignment(col)
 
             if col.name == 'th':
                 font_conf = scaled_font(header_conf, scale)
