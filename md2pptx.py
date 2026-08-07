@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 import traceback
 
+from config_schema import validate_config
 from generator import PPTXGenerator
 
 # theme.accent_color / theme.text_color を反映するフォント設定のキー
@@ -71,7 +72,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        config = apply_theme(load_config(args.config))
+        config = load_config(args.config)
+
+        # 変換を始める前に設定を検査し、原因の分かりにくいエラーを避ける
+        result = validate_config(config)
+        for warning in result.warnings:
+            print(f"Warning: {warning}")
+        if not result.is_valid:
+            print(f"Error: 設定ファイル '{args.config}' に問題があります。")
+            for message in result.errors:
+                print(f"  - {message}")
+            return 1
+
+        config = apply_theme(config)
         content = read_text_file(args.input)
 
         generator = PPTXGenerator(config)
