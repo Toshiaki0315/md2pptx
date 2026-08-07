@@ -26,12 +26,15 @@ from pptx.enum.text import PP_ALIGN
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Pt
 
+import extractor
 import md2pptx
 import mermaid_renderer
+import pptx2md
 import processors
 import utils
 import text_metrics
 from config_schema import validate_config
+from extractor import extract, write_images
 from generator import PPTXGenerator
 from layout import SlideLayout
 from text_metrics import (
@@ -2961,3 +2964,294 @@ class TestCli:
         captured = capsys.readouterr()
         assert "予期せぬエラー" in captured.out
         assert "ValueError" in captured.err
+
+
+# =====================================================================
+# extractor.py / pptx2md.py（PPTX → Markdown の逆変換）
+# =====================================================================
+
+
+@pytest.fixture
+def converted(base_config, tmp_path, png_file):
+    """Markdownから変換したPPTXを、逆変換して読み戻す"""
+    def convert(md, **config_overrides):
+        base_config["slides"].update(config_overrides)
+        gen = PPTXGenerator(base_config)
+        path = tmp_path / "src.pptx"
+        gen.generate(md.replace("{png}", png_file), str(path))
+        return extract(Presentation(str(path)))
+    return convert
+
+
+class TestExtractText:
+    """見出し・本文・リストの復元"""
+
+    def test_headings(self, converted):
+        result = converted("# タイトル\n\n## 中身\n本文\n")
+
+        assert "# タイトル" in result.markdown
+        assert "## 中身" in result.markdown
+
+    def test_subheading(self, converted):
+        """h3（行頭記号を消した段落）は ### に戻る"""
+        result = converted("## 見出し\n\n### 小見出し\n本文\n")
+        assert "### 小見出し" in result.markdown
+
+    def test_nested_list_indentation(self, converted):
+        """入れ子の階層はインデントで表現される"""
+        result = converted("## 見出し\n\n* 親\n    * 子\n        * 孫\n")
+
+        assert "* 親" in result.markdown
+        assert "    * 子" in result.markdown
+        assert "        * 孫" in result.markdown
+
+    def test_ordered_list(self, converted):
+        """自動採番の段落は番号付きリストに戻る"""
+        result = converted("## 手順\n\n1. 最初\n2. 次\n")
+        assert result.markdown.count("1. ") == 2  # Markdownでは連番でなくてよい
+
+    def test_inline_decorations(self, converted):
+        """太字・インラインコードが復元される"""
+        result = converted("## 見出し\n\n**太字** と `コード` です\n")
+
+        assert "**太字**" in result.markdown
+        assert "`コード`" in result.markdown
+
+    def test_slide_without_title_becomes_a_separator(self, converted):
+        """タイトルの無いスライド（--- 由来）は水平線に戻る"""
+        result = converted("## 見出し\n\n本文\n\n---\n\n続き\n")
+        assert "\n---\n" in result.markdown
+
+
+class TestExtractBlocks:
+    """表・コード・画像・ノートの復元"""
+
+    def test_table_with_alignment(self, converted):
+        """表は列揃えの指定ごと復元される"""
+        result = converted("## 表\n\n| 左 | 中 | 右 |\n| :--- | :---: | ---: |\n| a | b | c |\n")
+
+        assert "| 左 | 中 | 右 |" in result.markdown
+        assert "| :--- | :---: | ---: |" in result.markdown
+        assert "| a | b | c |" in result.markdown
+
+    def test_table_header_is_not_double_emphasized(self, converted):
+        """見出し行はMarkdown側で強調されるため ** を付けない"""
+        result = converted("## 表\n\n| 見出し |\n|---|\n| 値 |\n")
+        assert "| **見出し** |" not in result.markdown
+
+    def test_code_block(self, converted):
+        """コード枠はフェンス付きコードブロックに戻る"""
+        result = converted("## コード\n\n```python\nprint(1)\n```\n")
+
+        assert "```" in result.markdown
+        assert "print(1)" in result.markdown
+
+    def test_image_and_alt_text(self, converted):
+        """画像は書き出され、代替テキストが記法に戻る"""
+        result = converted("## 図\n\n![システム構成]({png})\n")
+
+        assert "![システム構成](images/image1.png)" in result.markdown
+        assert len(result.images) == 1
+        assert result.images[0].filename == "image1.png"
+
+    def test_same_image_shares_one_file(self, converted):
+        """同じ画像を複数回使っている場合は1ファイルにまとめ、同じ名前を参照する
+
+        連番を振ってしまうと、まとめた結果として存在しないファイルを
+        参照することになる。
+        """
+        result = converted("## 図\n\n![a]({png})\n\n## 図2\n\n![b]({png})\n")
+
+        assert len(result.images) == 1
+        assert result.markdown.count("images/image1.png") == 2
+
+    def test_speaker_notes(self, converted):
+        """スピーカーノートは引用記法に戻る"""
+        result = converted("## 見出し\n\n> メモです\n")
+        assert "> メモです" in result.markdown
+
+    def test_footer_is_not_extracted(self, converted):
+        """フッターやページ番号は内容ではないので取り出さない"""
+        result = converted(
+            "## 見出し\n\n本文\n", footer={"text": "社外秘", "date": "2026-05-10"}
+        )
+
+        assert "社外秘" not in result.markdown
+        assert "2026-05-10" not in result.markdown
+
+
+class TestRoundTrip:
+    """Markdown → PPTX → Markdown の往復"""
+
+    MD = (
+        "# タイトル\n\n## 中身\n\n* 項目1\n    * 入れ子\n\n1. 手順\n\n"
+        "### 小見出し\n\n**太字** と `コード`\n\n"
+        "| A | B |\n| :--- | ---: |\n| 1 | 2 |\n\n"
+        "```\ncode\n```\n\n![図]({png})\n\n> ノート\n"
+    )
+
+    def test_round_trip_is_stable(self, base_config, tmp_path, png_file):
+        """2回往復させても内容が変わらない
+
+        1回目の復元結果を再び変換して復元し、同じになることを確かめる。
+        """
+        md = self.MD.replace("{png}", png_file)
+
+        first = self._cycle(base_config, tmp_path, md, "1")
+        # 1回目の復元結果は images/ を参照するため、画像を書き出してから再変換する
+        write_images(first.images, str(tmp_path / "images"))
+        second = self._cycle(base_config, tmp_path, first.markdown, "2", cwd=tmp_path)
+
+        assert first.markdown == second.markdown
+
+    def _cycle(self, base_config, tmp_path, md, suffix, cwd=None):
+        import os
+        original = os.getcwd()
+        if cwd:
+            os.chdir(cwd)
+        try:
+            gen = PPTXGenerator(base_config)
+            path = tmp_path / f"cycle{suffix}.pptx"
+            gen.generate(md, str(path))
+            return extract(Presentation(str(path)))
+        finally:
+            os.chdir(original)
+
+    def test_content_survives_the_trip(self, base_config, tmp_path, png_file):
+        """主要な要素が往復後も残っている"""
+        gen = PPTXGenerator(base_config)
+        path = tmp_path / "src.pptx"
+        gen.generate(self.MD.replace("{png}", png_file), str(path))
+
+        markdown = extract(Presentation(str(path))).markdown
+        for expected in ["# タイトル", "## 中身", "### 小見出し", "**太字**",
+                         "`コード`", "| A | B |", "```", "> ノート"]:
+            assert expected in markdown
+
+
+class TestPptx2mdCli:
+    """逆変換のCLI"""
+
+    def _pptx(self, base_config, tmp_path, md="## 見出し\n\n本文\n"):
+        gen = PPTXGenerator(base_config)
+        path = tmp_path / "src.pptx"
+        gen.generate(md, str(path))
+        return str(path)
+
+    def test_parse_args_defaults(self):
+        args = pptx2md.parse_args(["deck.pptx"])
+        assert (args.input, args.output, args.image_dir) == ("deck.pptx", "output.md", None)
+
+    def test_main_success(self, base_config, tmp_path, capsys):
+        source = self._pptx(base_config, tmp_path)
+        output = tmp_path / "out.md"
+
+        assert pptx2md.main([source, "-o", str(output)]) == 0
+        assert "## 見出し" in output.read_text(encoding="utf-8")
+        assert "Success" in capsys.readouterr().out
+
+    def test_images_are_written(self, base_config, tmp_path, png_file, capsys):
+        source = self._pptx(base_config, tmp_path, f"## 図\n\n![a]({png_file})\n")
+        output = tmp_path / "out.md"
+
+        pptx2md.main([source, "-o", str(output)])
+
+        assert (tmp_path / "images" / "image1.png").exists()
+        assert "画像 1枚" in capsys.readouterr().out
+
+    def test_custom_image_dir(self, base_config, tmp_path, png_file):
+        source = self._pptx(base_config, tmp_path, f"## 図\n\n![a]({png_file})\n")
+        image_dir = tmp_path / "assets"
+
+        pptx2md.main([source, "-o", str(tmp_path / "o.md"), "--image-dir", str(image_dir)])
+
+        assert (image_dir / "image1.png").exists()
+
+    def test_missing_input(self, tmp_path, capsys):
+        assert pptx2md.main(["no_such.pptx", "-o", str(tmp_path / "o.md")]) == 1
+        assert "入力ファイル" in capsys.readouterr().out
+
+    def test_broken_input(self, tmp_path, capsys):
+        broken = tmp_path / "broken.pptx"
+        broken.write_text("これはPPTXではありません", encoding="utf-8")
+
+        assert pptx2md.main([str(broken), "-o", str(tmp_path / "o.md")]) == 1
+        assert "予期せぬエラー" in capsys.readouterr().out
+
+    def test_permission_error(self, base_config, tmp_path, mocker, capsys):
+        source = self._pptx(base_config, tmp_path)
+        # 読み込みには影響しないよう、書き出し側の open だけを差し替える
+        mocker.patch("pptx2md.open", side_effect=PermissionError, create=True)
+
+        assert pptx2md.main([source, "-o", str(tmp_path / "o.md")]) == 1
+        assert "書き込めません" in capsys.readouterr().out
+
+
+class TestExtractEdgeCases:
+    """逆変換の細かい挙動"""
+
+    def test_italic(self, converted):
+        """斜体も復元される"""
+        result = converted("## 見出し\n\n*斜体* です\n")
+        assert "*斜体*" in result.markdown
+
+    def test_title_slide_subtitle_is_not_a_list(self, converted):
+        """タイトルスライドのサブタイトルは箇条書きにしない"""
+        result = converted("# タイトル\nサブタイトル\n")
+
+        assert "サブタイトル" in result.markdown
+        assert "* サブタイトル" not in result.markdown
+
+    def test_image_without_alt_text(self, converted):
+        """代替テキストが無い画像は空の alt になる"""
+        result = converted("## 図\n\n![]({png})\n")
+        assert "![](images/image1.png)" in result.markdown
+
+    def test_empty_table_is_skipped(self):
+        """行の無い表は何も出力しない"""
+        table = MagicMock()
+        table.rows = []
+        assert extractor.table_to_markdown(table) == []
+
+    def test_slide_without_notes(self):
+        """ノートが無いスライドは引用を出さない"""
+        slide = MagicMock()
+        slide.has_notes_slide = False
+        assert extractor.notes_to_markdown(slide) == []
+
+    def test_empty_notes_are_skipped(self):
+        """ノート枠はあるが空の場合も引用を出さない"""
+        slide = MagicMock()
+        slide.has_notes_slide = True
+        slide.notes_slide.notes_text_frame.text = "   "
+
+        assert extractor.notes_to_markdown(slide) == []
+
+    def test_consecutive_blank_lines_are_collapsed(self):
+        """空行が3つ以上続く箇所は2つにまとめる"""
+        prs = MagicMock()
+        prs.slide_layouts = []
+        prs.slides = []
+        # 行の生成を差し替えて、空行が多い状態を作る
+        import extractor as ex
+        original = ex.slide_to_markdown
+        try:
+            prs.slides = [MagicMock()]
+            ex.slide_to_markdown = lambda *a, **k: ["A", "", "", "", "B"]
+            assert ex.extract(prs).markdown == "A\n\nB\n"
+        finally:
+            ex.slide_to_markdown = original
+
+    def test_shape_without_fill_is_not_a_code_box(self):
+        """塗りつぶしを調べられない図形はコード枠とみなさない"""
+        shape = MagicMock()
+        shape.is_placeholder = False
+        shape.has_text_frame = True
+        type(shape).fill = property(lambda self: (_ for _ in ()).throw(ValueError()))
+
+        assert extractor.is_code_box(shape) is False
+
+    def test_blank_lines_are_collapsed(self, converted):
+        """空行が続く箇所はまとめられる"""
+        result = converted("## 見出し\n\n本文1\n\n本文2\n")
+        assert "\n\n\n" not in result.markdown
