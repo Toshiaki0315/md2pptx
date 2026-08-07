@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
+from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Pt
 
 import md2pptx
@@ -59,6 +60,8 @@ from processors import (
 )
 from utils import (
     DEFAULT_IMAGE_DPI,
+    apply_auto_numbering,
+    disable_bullet,
     set_alt_text,
     add_runs_from_tag,
     append_text_block,
@@ -468,6 +471,27 @@ class TestUtilsArePure:
 
         append_text_block(text_frame, parse_md("本文").find("p"), reuse_first_paragraph=True)
         assert text_frame.paragraphs[0].runs[0].text == "本文"
+
+    def test_bullet_replaces_the_existing_mark(self):
+        """行頭記号を切り替えると、以前の指定は残らない"""
+        paragraph = new_paragraph()
+        apply_auto_numbering(paragraph)
+        disable_bullet(paragraph)
+
+        xml = paragraph._element.xml
+        assert "buNone" in xml
+        assert "buAutoNum" not in xml
+
+    def test_bullet_is_placed_before_its_successors(self):
+        """行頭記号は defRPr など後続要素の前に挿入する（スキーマの順序）"""
+        paragraph = new_paragraph()
+        p_pr = paragraph._element.get_or_add_pPr()
+        p_pr.append(OxmlElement("a:defRPr"))
+
+        apply_auto_numbering(paragraph)
+
+        tags = [child.tag.rsplit("}", 1)[-1] for child in p_pr]
+        assert tags.index("buAutoNum") < tags.index("defRPr")
 
     def test_set_alt_text(self):
         """図形に代替テキストを設定できる"""
@@ -999,6 +1023,88 @@ class TestProcessBlockquote:
         assert gen_with_slide.current_slide.notes_slide.notes_text_frame.text == "直書き"
 
 
+class TestMultipleImages:
+    """同じスライドに複数の画像を置いたときの配置"""
+
+    def _generate(self, gen, count, tmp_path, png_file, text=""):
+        images = "\n\n".join(f"![図{n}]({png_file})" for n in range(count))
+        gen.generate(f"## 図のスライド\n\n{text}\n\n{images}\n", str(tmp_path / "out.pptx"))
+        return [
+            s for s in gen.prs.slides[0].shapes
+            if s.shape_type is not None and "PICTURE" in str(s.shape_type)
+        ]
+
+    @pytest.mark.parametrize("count", [2, 3, 4, 6])
+    def test_images_do_not_overlap(self, gen, count, tmp_path, png_file):
+        """複数の画像が重ならずに配置される
+
+        従来は各画像が同じ枠に配置され、完全に重なって最後の1枚しか見えなかった。
+        """
+        pictures = self._generate(gen, count, tmp_path, png_file)
+
+        assert len(pictures) == count
+        boxes = [(p.left, p.top, p.width, p.height) for p in pictures]
+        for i, a in enumerate(boxes):
+            for b in boxes[i + 1:]:
+                overlap_x = a[0] < b[0] + b[2] and b[0] < a[0] + a[2]
+                overlap_y = a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+                assert not (overlap_x and overlap_y)
+
+    @pytest.mark.parametrize("count, expected", [(1, (1, 1)), (2, (2, 1)), (3, (3, 1)), (4, (2, 2)), (6, (3, 2)), (9, (3, 3))])
+    def test_grid_shape(self, count, expected):
+        """3枚までは横一列、4枚以上は正方形に近いグリッドにする"""
+        assert processors.image_grid(count) == expected
+
+    def test_no_images_is_noop(self, gen_with_slide):
+        """画像が無いスライドで呼ばれても何もしない"""
+        processors.arrange_images(gen_with_slide)
+        assert gen_with_slide.current_images == []
+
+    def test_images_stay_inside_the_content_area(self, gen, tmp_path, png_file):
+        """並べた画像がコンテンツ領域からはみ出さない"""
+        pictures = self._generate(gen, 4, tmp_path, png_file)
+        layout = gen.layout
+
+        for picture in pictures:
+            assert picture.left >= layout.content_left
+            assert picture.left + picture.width <= layout.content_left + layout.content_width
+            assert picture.top + picture.height <= layout.content_top + layout.content_height
+
+    def test_images_go_to_the_right_column_with_text(self, gen, tmp_path, png_file):
+        """テキストがある場合、複数画像は右半分の中で並ぶ"""
+        pictures = self._generate(gen, 2, tmp_path, png_file, text="説明文です。")
+
+        for picture in pictures:
+            assert picture.left >= gen.layout.split_right_left
+
+    def test_single_image_is_centered_in_the_full_area(self, gen, tmp_path, png_file):
+        """1枚だけの場合は従来どおりコンテンツ領域の中央に配置する"""
+        (picture,) = self._generate(gen, 1, tmp_path, png_file)
+        layout = gen.layout
+
+        left_margin = picture.left - layout.content_left
+        right_margin = (layout.content_left + layout.content_width) - (
+            picture.left + picture.width
+        )
+        assert left_margin == pytest.approx(right_margin, abs=Inches(0.01))
+
+    def test_images_are_reset_per_slide(self, gen, tmp_path, png_file):
+        """スライドが変わると画像の並べ直しは新しいスライド内で完結する"""
+        md = f"## 1枚目\n\n![a]({png_file})\n\n## 2枚目\n\n![b]({png_file})\n"
+        gen.generate(md, str(tmp_path / "out.pptx"))
+
+        assert len(gen.current_images) == 1
+
+    @patch("processors.arrange_images")
+    def test_fixed_position_is_not_rearranged(self, mock_arrange, base_config, tmp_path, png_file):
+        """position_inches で明示配置した画像は自動配置の対象にしない"""
+        base_config["images"]["position_inches"] = [1.0, 1.0]
+        gen = PPTXGenerator(base_config)
+        gen.generate(f"## 図\n\n![a]({png_file})\n", str(tmp_path / "out.pptx"))
+
+        mock_arrange.assert_not_called()
+
+
 class TestProcessImage:
     def test_local_path_is_inserted(self, gen_with_slide, png_file):
         """ローカル画像はダウンロードせずにそのまま挿入される"""
@@ -1366,6 +1472,85 @@ class TestProcessCodeOrMermaid:
             gen_with_slide, parse_md("```mermaid\ngraph TD; A-->B;\n```").find("pre")
         )
         assert "Mermaid図形の生成に失敗しました" in capsys.readouterr().out
+
+
+class TestOrderedList:
+    """番号付きリスト（ol）と箇条書き（ul）の区別"""
+
+    AUTO_NUM = "buAutoNum"
+
+    def _marks(self, gen):
+        return [
+            self.AUTO_NUM in p._element.xml for p in gen.current_body.paragraphs if p.text.strip()
+        ]
+
+    def test_ordered_list_gets_numbering(self, gen_with_slide):
+        """番号付きリストにはPowerPointの自動採番を設定する
+
+        従来は ul と ol で見た目が変わらず、手順書として読めなかった。
+        """
+        for item in parse_md("1. 手順1\n2. 手順2\n").find_all("li"):
+            process_text(gen_with_slide, item)
+
+        assert self._marks(gen_with_slide) == [True, True]
+
+    def test_unordered_list_is_unchanged(self, gen_with_slide):
+        """箇条書きは従来どおり（採番しない）"""
+        for item in parse_md("* 項目A\n* 項目B\n").find_all("li"):
+            process_text(gen_with_slide, item)
+
+        assert self._marks(gen_with_slide) == [False, False]
+
+    def test_mixed_lists(self, gen, tmp_path):
+        """同じスライド内で箇条書きと番号付きリストが混在しても区別される"""
+        gen.generate("## 混在\n\n* 箇条書き\n\n1. 手順\n", str(tmp_path / "out.pptx"))
+        assert self._marks(gen) == [False, True]
+
+    def test_nested_ordered_list(self, gen, tmp_path):
+        """入れ子の番号付きリストにも採番される"""
+        gen.generate("## 手順\n\n1. 手順1\n    1. 手順1-1\n", str(tmp_path / "out.pptx"))
+
+        assert self._marks(gen) == [True, True]
+        assert [p.level for p in gen.current_body.paragraphs] == [0, 1]
+
+    def test_ordered_item_inside_unordered_list(self, gen, tmp_path):
+        """直近の親がulなら、外側にolがあっても採番しない"""
+        gen.generate("## 混在\n\n1. 手順\n    * 補足\n", str(tmp_path / "out.pptx"))
+        assert self._marks(gen) == [True, False]
+
+    @pytest.mark.parametrize(
+        "html, expected",
+        [
+            ("<ol><li>a</li></ol>", True),
+            ("<ul><li>a</li></ul>", False),
+            ("<ol><li><ul><li>a</li></ul></li></ol>", False),  # 直近の親はul
+        ],
+    )
+    def test_is_ordered_item(self, html, expected):
+        item = parse_html(html).find_all("li")[-1]
+        assert processors.is_ordered_item(item) is expected
+
+    def test_ordered_font_can_be_configured(self, base_config):
+        """ordered_level_N で番号付きリストだけ書式を変えられる"""
+        base_config["fonts"]["bullet_level_1"] = {"size_pt": 18}
+        base_config["fonts"]["ordered_level_1"] = {"size_pt": 14}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        process_text(gen, parse_md("* 箇条書き").find("li"))
+        process_text(gen, parse_md("1. 手順").find("li"))
+
+        sizes = [p.runs[0].font.size for p in gen.current_body.paragraphs]
+        assert sizes == [Pt(18), Pt(14)]
+
+    def test_ordered_falls_back_to_bullet_config(self, base_config):
+        """ordered_level_N が無ければ bullet_level_N を使う（設定追加は任意）"""
+        base_config["fonts"]["bullet_level_1"] = {"size_pt": 18}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        process_text(gen, parse_md("1. 手順").find("li"))
+        assert gen.current_body.paragraphs[0].runs[0].font.size == Pt(18)
 
 
 class TestProcessText:

@@ -72,6 +72,10 @@ fonts:
     size_pt: 18
     bold: false
     color_rgb: [50, 50, 50] # 少し薄い灰色
+  # 番号付きリスト（ol）の書式。未指定なら bullet_level_N に従う
+  # ordered_level_1:
+  #   name: "Yu Gothic"
+  #   size_pt: 16
   inline_code:
     name: "Consolas"
     color_rgb: [220, 20, 60] # クリムゾンレッド

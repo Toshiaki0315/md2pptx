@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import requests
 from io import BytesIO
@@ -23,8 +24,11 @@ from utils import (
     DEFAULT_IMAGE_DPI,
     FontConfig,
     ImageSource,
+    apply_auto_numbering,
     apply_font_style,
+    disable_bullet,
     downscale_image,
+    fit_shape_into,
     insert_image_fit,
     set_alt_text,
     shrink_body_shape,
@@ -47,6 +51,12 @@ NOTE_BLOCK_TAGS = ['p', 'li']
 
 # 箇条書きのインデントレベルの上限（PowerPointの仕様）
 MAX_BULLET_LEVEL = 8
+
+# 画像を横一列に並べる上限の枚数（これを超えたらグリッド配置にする）
+MAX_IMAGES_IN_A_ROW = 3
+
+# 並べた画像どうしの間隔
+IMAGE_GUTTER_INCHES = 0.2
 
 # slides.h3_as に指定できる値。h3 をスライド内の小見出しにするか、新規スライドにするか
 H3_AS_SUBHEADING = 'subheading'
@@ -100,6 +110,7 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     generator.current_body.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     generator.current_body.text = "" 
     generator.slide_has_text = False
+    generator.current_images = []
 
     # デフォルト枠のはみ出し補正
     if not generator.slides_conf.get('template_path'):
@@ -143,15 +154,10 @@ def process_h3(generator: PPTXGenerator, tag: Tag) -> None:
     from pptx.util import Pt
     
     p = generator.current_body.add_paragraph()
-    # 箇条書きを完全に無効化
-    from pptx.oxml.xmlchemy import OxmlElement
     p.level = 0
-    p_pr = p._element.get_or_add_pPr()
-    buNone = OxmlElement('a:buNone')
-    p_pr.insert(0, buNone)
-    
     p.space_before = Pt(10)
     p.space_after = Pt(2)
+    disable_bullet(p)  # 見出しなので行頭記号は出さない
     
     run = p.add_run()
     run.text = tag.get_text()
@@ -185,7 +191,8 @@ def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
     
     generator.current_body.text = "" 
     generator.slide_has_text = False
-    
+    generator.current_images = []
+
     if not generator.slides_conf.get('template_path'):
         try:
             layout = generator.layout
@@ -300,6 +307,49 @@ def place_image_split(generator: PPTXGenerator, img_data: ImageSource) -> Pictur
         layout.split_right_width, layout.content_height,
     )
 
+def image_grid(count: int) -> tuple[int, int]:
+    """画像の枚数から (列数, 行数) を決める
+
+    3枚までは横一列に並べる。スライドは横長なので、その方が1枚あたりが大きくなる。
+    4枚以上は正方形に近いグリッドに収める。
+    """
+    if count <= MAX_IMAGES_IN_A_ROW:
+        return count, 1
+    columns = math.ceil(math.sqrt(count))
+    return columns, math.ceil(count / columns)
+
+def arrange_images(generator: PPTXGenerator) -> None:
+    """同じスライド上の画像が重ならないように並べ直す
+
+    画像は現れた順に1枚ずつ配置するため、何枚になるかは事前に分からない。
+    そこで追加のたびに、その時点の枚数で全体を並べ直す。
+    """
+    images = generator.current_images
+    if not images:
+        return
+
+    layout = generator.layout
+    if generator.slide_has_text or generator.forced_layout == '2-column':
+        area_left, area_width = layout.split_right_left, layout.split_right_width
+    else:
+        area_left, area_width = layout.content_left, layout.content_width
+    area_top, area_height = layout.content_top, layout.content_height
+
+    columns, rows = image_grid(len(images))
+    gutter = Inches(IMAGE_GUTTER_INCHES)
+    cell_width = (area_width - gutter * (columns - 1)) / columns
+    cell_height = (area_height - gutter * (rows - 1)) / rows
+
+    for index, picture in enumerate(images):
+        row, column = divmod(index, columns)
+        fit_shape_into(
+            picture,
+            Emu(int(area_left + (cell_width + gutter) * column)),
+            Emu(int(area_top + (cell_height + gutter) * row)),
+            Emu(int(cell_width)),
+            Emu(int(cell_height)),
+        )
+
 def load_image(src: str) -> ImageSource:
     """画像URLならダウンロードし、ローカルパスならそのまま返す"""
     if src.startswith(('http://', 'https://')):
@@ -339,6 +389,11 @@ def process_image(generator: PPTXGenerator, tag: Tag) -> None:
 
         # Markdownの代替テキスト（![説明](...) の「説明」）を引き継ぐ
         set_alt_text(picture, str(tag.get('alt') or ''))
+
+        # 固定位置の指定がある場合は利用者の指定を尊重し、自動配置の対象にしない
+        if not (pos and len(pos) >= 2):
+            generator.current_images.append(picture)
+            arrange_images(generator)
     except Exception as e:
         print(f"Warning: 画像の挿入に失敗しました: {e}")
 
@@ -505,44 +560,64 @@ def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
                 return
 
             if generator.slide_has_text:
-                place_image_split(generator, BytesIO(image))
+                picture = place_image_split(generator, BytesIO(image))
             else:
-                place_image_full(generator, BytesIO(image))
+                picture = place_image_full(generator, BytesIO(image))
+            generator.current_images.append(picture)
+            arrange_images(generator)
         except Exception as e:
             print(f"Warning: Mermaid図形の生成に失敗しました: {e}")
     else:
         append_code_textbox(generator, tag.get_text(), language=language)
 
-def bullet_font_conf(fonts_conf: dict[str, FontConfig], level: int) -> FontConfig | None:
-    """指定レベルの箇条書きのフォント設定を返す
+def bullet_font_conf(
+    fonts_conf: dict[str, FontConfig], level: int, ordered: bool = False
+) -> FontConfig | None:
+    """指定レベルのリストのフォント設定を返す
+
+    番号付きリスト（ol）は ordered_level_N を優先し、無ければ
+    箇条書き（ul）の bullet_level_N を使う。手順書だけ書式を変えたい場合に
+    ordered_level_N を足すだけで済むようにするため。
 
     設定が無いレベルは、より浅いレベルの設定を引き継ぐ。
     いきなり body へフォールバックすると、ネストした途端に書体やサイズが
-    変わってしまうため（body は本文用で、箇条書きとは役割が異なる）。
+    変わってしまうため（body は本文用で、リストとは役割が異なる）。
     """
-    for candidate in range(level + 1, 0, -1):
-        conf = fonts_conf.get(f'bullet_level_{candidate}')
-        if conf:
-            return conf
+    prefixes = ('ordered_level_', 'bullet_level_') if ordered else ('bullet_level_',)
+    for prefix in prefixes:
+        for candidate in range(level + 1, 0, -1):
+            conf = fonts_conf.get(f'{prefix}{candidate}')
+            if conf:
+                return conf
     return fonts_conf.get('body')
+
+def is_ordered_item(tag: Tag) -> bool:
+    """リスト項目が番号付きリスト（ol）に属するかを判定する"""
+    parent = tag.find_parent(['ul', 'ol'])
+    return parent is not None and parent.name == 'ol'
 
 def process_text(generator: PPTXGenerator, tag: Tag) -> None:
     """段落・リストの処理"""
     if not tag.get_text(strip=True): return
 
+    ordered = False
     if tag.name == 'li':
         level = min(len(tag.find_parents(['ul', 'ol'])) - 1, MAX_BULLET_LEVEL)
-        font_conf = bullet_font_conf(generator.fonts_conf, level)
+        ordered = is_ordered_item(tag)
+        font_conf = bullet_font_conf(generator.fonts_conf, level, ordered)
     else:
         level = 0
         font_conf = generator.fonts_conf.get('body')
 
 
-    append_text_block(
+    paragraph = append_text_block(
         generator.current_body, tag,
         reuse_first_paragraph=not generator.slide_has_text,
         level=level,
         font_conf=font_conf,
         inline_code_conf=inline_code_conf(generator),
     )
+    if ordered:
+        # PowerPoint側で採番させる（項目を入れ替えても番号が崩れない）
+        apply_auto_numbering(paragraph)
     generator.slide_has_text = True
