@@ -33,12 +33,12 @@ KNOWN_MERMAID = (
 #: フォント設定の項目
 KNOWN_FONT_FIELDS = ('name', 'size_pt', 'bold', 'color_rgb')
 
-#: コードが参照するフォント設定のキー（bullet_level_N は別途パターンで判定）
+#: コードが参照するフォント設定のキー（bullet_level_N / ordered_level_N は別途パターンで判定）
 KNOWN_FONT_KEYS = (
     'title', 'title_h1', 'title_h2', 'title_h3', 'body',
     'inline_code', 'code_block', 'table_header', 'table_body',
 )
-BULLET_LEVEL_PATTERN = re.compile(r'^bullet_level_\d+$')
+BULLET_LEVEL_PATTERN = re.compile(r'^(bullet|ordered)_level_\d+$')
 
 #: 選択肢が決まっている項目
 VALID_LAYOUTS = ('16:9', '4:3', '16:10', 'A4')

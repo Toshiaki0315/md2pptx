@@ -14,6 +14,8 @@ from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any, Union
 
 from PIL import Image
+from pptx.oxml.ns import qn
+from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Length, Pt
 
 from text_metrics import (
@@ -54,6 +56,15 @@ DEFAULT_INLINE_CODE_COLOR = [220, 20, 60]
 CODE_BOX_MARGIN_INCHES = 0.2
 CODE_BOX_LINE_SPACING = 1.1
 
+#: 段落の行頭記号を指定する要素（差し替え時に取り除く）
+BULLET_TAGS = ('a:buNone', 'a:buAutoNum', 'a:buChar')
+
+#: pPr 内で行頭記号より後ろに来る要素（この直前に挿入する）
+BULLET_SUCCESSOR_TAGS = ('a:tabLst', 'a:defRPr', 'a:extLst')
+
+#: 番号付きリストの既定の書式（1. 2. 3.）
+DEFAULT_NUMBER_FORMAT = 'arabicPeriod'
+
 
 def hex_to_rgb(hex_str: str | None) -> RGBColor | None:
     if not hex_str: return None
@@ -88,6 +99,54 @@ def apply_syntax_highlight(
 
         if token_style['bold']: run.font.bold = True
         if token_style['italic']: run.font.italic = True
+
+def _set_bullet(paragraph: _Paragraph, bullet: Any) -> None:
+    """段落の行頭記号の指定を差し替える
+
+    DrawingMLでは pPr の子要素の順序が決まっており、行頭記号の指定は
+    tabLst / defRPr / extLst より前に置く必要がある。
+    """
+    p_pr = paragraph._element.get_or_add_pPr()
+
+    for tag in BULLET_TAGS:
+        for existing in p_pr.findall(qn(tag)):
+            p_pr.remove(existing)
+
+    for tag in BULLET_SUCCESSOR_TAGS:
+        successor = p_pr.find(qn(tag))
+        if successor is not None:
+            successor.addprevious(bullet)
+            return
+    p_pr.append(bullet)
+
+
+def disable_bullet(paragraph: _Paragraph) -> None:
+    """段落の行頭記号を消す（見出しなど、箇条書きに見せたくない段落用）"""
+    _set_bullet(paragraph, OxmlElement('a:buNone'))
+
+
+def apply_auto_numbering(
+    paragraph: _Paragraph, number_format: str = DEFAULT_NUMBER_FORMAT
+) -> None:
+    """段落に自動採番（1. 2. 3. …）を設定する
+
+    番号はPowerPoint側で振られるため、項目を入れ替えても振り直す必要がない。
+    """
+    bullet = OxmlElement('a:buAutoNum')
+    bullet.set('type', number_format)
+    _set_bullet(paragraph, bullet)
+
+
+def fit_shape_into(
+    shape: BaseShape, left: Length, top: Length, max_width: Length, max_height: Length
+) -> None:
+    """既に配置済みの図形を、縦横比を保ったまま指定枠に収めて中央に置く"""
+    ratio = min(max_width / shape.width, max_height / shape.height)
+    shape.width = Emu(int(shape.width * ratio))
+    shape.height = Emu(int(shape.height * ratio))
+    shape.left = Emu(int(left + (max_width - shape.width) / 2))
+    shape.top = Emu(int(top + (max_height - shape.height) / 2))
+
 
 def apply_font_style(run: _Run, font_config: FontConfig | None) -> None:
     """フォントスタイルの適用"""
@@ -257,11 +316,12 @@ def append_text_block(
     level: int = 0,
     font_conf: FontConfig | None = None,
     inline_code_conf: FontConfig | None = None,
-) -> None:
+) -> _Paragraph:
     """段落オブジェクトを追加し、テキストまたはタグ構造を書き込むヘルパー
 
     reuse_first_paragraph が真で、かつ枠が空のときは、既存の空段落を再利用する
     （先頭に空行が入るのを避けるため）。
+    追加した段落を返す（採番など、呼び出し側で追加の指定を行うため）。
     """
     is_empty = len(text_frame.paragraphs) == 1 and not text_frame.paragraphs[0].text
     if reuse_first_paragraph and is_empty:
@@ -274,6 +334,7 @@ def append_text_block(
     p.line_spacing = 1.2    # 行間を1.2倍に設定
 
     add_runs_from_tag(content, p, font_conf, inline_code_conf)
+    return p
 
 def create_code_textbox(
     slide: Slide,

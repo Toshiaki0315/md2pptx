@@ -44,6 +44,8 @@ class PPTXGenerator:
         self.prs: Any = None
         self.current_slide: Any = None
         self.current_body: Any = None
+        # 現在のスライドに置いた画像（重ならないよう並べ直すために保持する）
+        self.current_images: list[Any] = []
         self.slide_has_text: bool = False
         self.forced_layout: str | None = None
 
