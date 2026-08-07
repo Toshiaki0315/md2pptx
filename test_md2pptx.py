@@ -608,20 +608,22 @@ class TestAppendCodeTextbox:
         gen_with_slide.slide_has_text = True
         processors.append_code_textbox(gen_with_slide, "x", language="python")
 
-        assert gen_with_slide.current_slide.placeholders[1].width == Inches(4.5)
-        assert textboxes_of(gen_with_slide.current_slide)[0].left == Inches(5.0)
+        layout = gen_with_slide.layout
+        assert gen_with_slide.current_slide.placeholders[1].width == layout.split_body_width
+        assert textboxes_of(gen_with_slide.current_slide)[0].left == layout.split_right_left
 
     def test_center_layout(self, gen_with_slide):
         """forced_layout=center では中央寄せの枠になる"""
         gen_with_slide.forced_layout = "center"
         processors.append_code_textbox(gen_with_slide, "x", language="python")
-        assert textboxes_of(gen_with_slide.current_slide)[0].left == Inches(1.5)
+        assert textboxes_of(gen_with_slide.current_slide)[0].left == gen_with_slide.layout.center_left
 
     def test_default_layout(self, gen_with_slide):
         """テキストが無い場合はスライド幅いっぱいに配置する"""
         processors.append_code_textbox(gen_with_slide, "x", language="python")
         box = textboxes_of(gen_with_slide.current_slide)[0]
-        assert (box.left, box.width) == (Inches(1.0), Inches(8.0))
+        layout = gen_with_slide.layout
+        assert (box.left, box.width) == (layout.content_left, layout.content_width)
 
 
 class TestAutoShrinkText:
@@ -966,16 +968,17 @@ class TestProcessImage:
         gen_with_slide.slide_has_text = True
         process_image(gen_with_slide, parse_html(f'<img src="{png_file}">').img)
 
+        layout = gen_with_slide.layout
         args = mock_fit.call_args[0]
-        assert (args[2], args[4]) == (Inches(5.2), Inches(4.5))
-        assert gen_with_slide.current_slide.placeholders[1].width == Inches(4.8)
+        assert (args[2], args[4]) == (layout.split_right_left, layout.split_right_width)
+        assert gen_with_slide.current_slide.placeholders[1].width == layout.split_body_width
 
     @patch("processors.insert_image_fit")
     def test_forced_two_column_layout(self, mock_fit, gen_with_slide, png_file):
         """forced_layout=2-column ではテキストが無くても右側に配置する"""
         gen_with_slide.forced_layout = "2-column"
         process_image(gen_with_slide, parse_html(f'<img src="{png_file}">').img)
-        assert mock_fit.call_args[0][2] == Inches(5.2)
+        assert mock_fit.call_args[0][2] == gen_with_slide.layout.split_right_left
 
     @patch("processors.insert_image_fit")
     def test_forced_center_layout(self, mock_fit, gen_with_slide, png_file):
@@ -984,9 +987,10 @@ class TestProcessImage:
         gen_with_slide.forced_layout = "center"
         process_image(gen_with_slide, parse_html(f'<img src="{png_file}">').img)
 
+        layout = gen_with_slide.layout
         assert (mock_fit.call_args[0][2], mock_fit.call_args[0][4]) == (
-            Inches(1.0),
-            Inches(8.0),
+            layout.content_left,
+            layout.content_width,
         )
 
     def _pictures_of(self, slide):
@@ -1085,8 +1089,9 @@ class TestProcessTable:
         process_table(gen_with_slide, parse_md(self.MD_TABLE).find("table"))
 
         shape = [s for s in gen_with_slide.current_slide.shapes if s.has_table][0]
-        assert shape.top == Inches(2.8)
-        assert gen_with_slide.current_slide.placeholders[1].height == Inches(2.0)
+        assert shape.top == gen_with_slide.layout.table_split_top
+        assert (gen_with_slide.current_slide.placeholders[1].height
+                == gen_with_slide.layout.table_split_body_height)
 
     def test_column_alignment_is_applied(self, gen_with_slide):
         """Markdownの列揃え指定（:---: など）がセルに反映される"""
@@ -1125,7 +1130,7 @@ class TestProcessTable:
         """テキストが無い場合は表を上部から配置する"""
         process_table(gen_with_slide, parse_md(self.MD_TABLE).find("table"))
         shape = [s for s in gen_with_slide.current_slide.shapes if s.has_table][0]
-        assert shape.top == Inches(1.5)
+        assert shape.top == gen_with_slide.layout.content_top
 
     def _long_table(self, data_rows):
         body = "\n".join(f"| 項目{i} | 値{i} |" for i in range(data_rows))
@@ -1253,7 +1258,7 @@ class TestProcessCodeOrMermaid:
         process_code_or_mermaid(
             gen_with_slide, parse_md("```mermaid\ngraph TD; A-->B;\n```").find("pre")
         )
-        assert mock_fit.call_args[0][2] == Inches(5.2)
+        assert mock_fit.call_args[0][2] == gen_with_slide.layout.split_right_left
 
     @patch("processors.insert_image_fit")
     @patch("requests.get")
@@ -1563,66 +1568,114 @@ class TestFitScale:
 
 
 class TestSlideLayout:
-    """スライドサイズからの配置寸法の導出"""
+    """配置寸法の導出
 
-    #: 16:9 における従来の固定値（この値を再現できることが移行の前提）
-    LEGACY_16_9 = {
-        "content_left": 1.0,
-        "content_top": 1.5,
-        "content_width": 8.0,
-        "content_height": 3.8,
-        "split_body_width": 4.8,
-        "code_split_body_width": 4.5,
-        "split_image_left": 5.2,
-        "split_image_width": 4.5,
-        "table_split_top": 2.8,
-        "table_split_body_height": 2.0,
-        "code_split_left": 5.0,
-        "code_split_width": 4.5,
-        "code_center_left": 1.5,
-        "code_center_width": 7.0,
-        "code_full_top": 2.0,
-        "code_full_height": 3.0,
-    }
+    絶対値そのものより、要素どうしが揃っているかを検証する。
+    寸法の微調整でテストが壊れず、崩れたときには確実に落ちるようにするため。
+    """
 
-    @pytest.mark.parametrize("name, expected", sorted(LEGACY_16_9.items()))
-    def test_16_9_reproduces_legacy_values(self, name, expected):
-        """16:9では従来の固定値と一致する（既存資料の見た目を変えないための回帰テスト）"""
-        layout = SlideLayout(Inches(10), Inches(5.625))
-        assert Emu(getattr(layout, name)).inches == pytest.approx(expected, abs=0.001)
+    def _layout(self, width_in=10, height_in=5.625, **body):
+        return SlideLayout(Inches(width_in), Inches(height_in), **body)
+
+    def test_content_area_follows_the_body_placeholder(self):
+        """コンテンツ領域は本文プレースホルダーに一致する
+
+        画像・表だけが別の余白で配置されると左端が揃わないため、
+        テンプレートが定めた本文の位置をそのまま基準にする。
+        """
+        layout = self._layout(
+            body_left=Inches(0.5), body_top=Inches(1.75), body_width=Inches(9.0)
+        )
+        assert layout.content_left == Inches(0.5)
+        assert layout.content_top == Inches(1.75)
+        assert layout.content_width == Inches(9.0)
+
+    def test_falls_back_without_a_placeholder(self):
+        """プレースホルダーが無いテンプレートでは既定の余白を使う"""
+        layout = self._layout()
+        assert layout.content_left == Inches(0.5)
+        assert layout.content_width == Inches(9.0)  # 10 - 0.5×2
+
+    def test_built_from_presentation(self, base_config):
+        """ジェネレーターは実際のテンプレートから寸法を取り込む"""
+        gen = PPTXGenerator(base_config)
+        body = gen.prs.slide_layouts[1].placeholders[1]
+
+        assert gen.layout.content_left == body.left
+        assert gen.layout.content_top == body.top
+        assert gen.layout.content_width == body.width
+
+    # --- 整合性 ---
+
+    def test_full_width_and_split_share_the_right_edge(self):
+        """全幅の要素と2カラム時の要素で右端が揃う
+
+        従来は全幅が右余白1.0インチ、2カラム時の図が0.3インチと食い違っていた。
+        """
+        layout = self._layout(
+            body_left=Inches(0.5), body_top=Inches(1.75), body_width=Inches(9.0)
+        )
+        assert layout.split_right_left + layout.split_right_width == (
+            layout.content_left + layout.content_width
+        )
+
+    def test_split_columns_do_not_overlap(self):
+        """2カラムの本文と図が重ならず、間隔が空く"""
+        layout = self._layout(
+            body_left=Inches(0.5), body_top=Inches(1.75), body_width=Inches(9.0)
+        )
+        body_right = layout.content_left + layout.split_body_width
+        assert body_right < layout.split_right_left
+        assert layout.split_right_left - body_right == Inches(0.3)
+
+    def test_table_does_not_overlap_the_body(self):
+        """表と本文枠が重ならない
+
+        従来は本文枠の下端が表の上端より約0.95インチ下にあり、矩形が重なっていた。
+        """
+        layout = self._layout(
+            body_left=Inches(0.5), body_top=Inches(1.75), body_width=Inches(9.0)
+        )
+        body_bottom = layout.content_top + layout.table_split_body_height
+        assert body_bottom < layout.table_split_top
+
+    def test_centered_box_is_symmetric(self):
+        """中央寄せの枠は左右の余白が等しい"""
+        layout = self._layout(
+            body_left=Inches(0.5), body_top=Inches(1.75), body_width=Inches(9.0)
+        )
+        left_margin = layout.center_left - layout.content_left
+        right_margin = (layout.content_left + layout.content_width) - (
+            layout.center_left + layout.center_width
+        )
+        assert left_margin == pytest.approx(right_margin, abs=2)
+
+    # --- スライドサイズへの追従 ---
 
     @pytest.mark.parametrize(
         "width_in, height_in",
         [(10, 5.625), (10, 7.5), (10, 6.25), (11.69, 8.27)],  # 16:9 / 4:3 / 16:10 / A4
     )
-    def test_content_area_follows_slide_size(self, width_in, height_in):
-        """コンテンツ領域はスライドサイズに追従し、左右・下の余白は一定になる"""
-        layout = SlideLayout(Inches(width_in), Inches(height_in))
-
-        assert Emu(layout.content_width).inches == pytest.approx(width_in - 2.0, abs=0.001)
+    def test_content_height_follows_slide_size(self, width_in, height_in):
+        """コンテンツの高さはスライドサイズに追従し、下の余白は一定になる"""
+        layout = self._layout(width_in, height_in, body_top=Inches(1.75))
         assert Emu(layout.content_height).inches == pytest.approx(
-            height_in - 1.5 - 0.325, abs=0.001
+            height_in - 1.75 - 0.5, abs=0.001
         )
 
     @pytest.mark.parametrize("width_in", [10, 11.69, 13.333])
-    def test_split_image_reaches_right_margin(self, width_in):
-        """2カラム時の図は、スライド幅によらず右端の余白まで広がる"""
-        layout = SlideLayout(Inches(width_in), Inches(7.5))
-        right_edge = Emu(layout.split_image_left + layout.split_image_width).inches
-        assert right_edge == pytest.approx(width_in - 0.3, abs=0.001)
+    def test_split_follows_slide_width(self, width_in):
+        """画角が変わっても2カラムの右端はコンテンツ領域の右端に揃う"""
+        layout = self._layout(width_in, body_width=Inches(width_in - 1.0))
+        assert layout.split_right_left + layout.split_right_width == (
+            layout.content_left + layout.content_width
+        )
 
     def test_body_height_fits_in_slide(self):
         """本文枠の高さはスライド下端に余白を残す"""
-        layout = SlideLayout(Inches(10), Inches(7.5))
+        layout = self._layout(10, 7.5)
         assert Emu(layout.body_height_for(Inches(1.75))).inches == pytest.approx(5.25)
 
-    def test_built_from_presentation(self, base_config):
-        """ジェネレーターはプレゼンテーションの実サイズからレイアウトを構築する"""
-        base_config["slides"]["layout"] = "A4"
-        gen = PPTXGenerator(base_config)
-
-        assert gen.layout.width == gen.prs.slide_width
-        assert gen.layout.height == gen.prs.slide_height
 
 
 class TestLayoutAdaptsToSlideSize:
@@ -1951,14 +2004,14 @@ class TestLayoutComments:
         gen.generate(md, str(tmp_path / "out.pptx"))
 
         assert gen.forced_layout == "2-column"
-        assert mock_fit.call_args[0][2] == Inches(5.2)
+        assert mock_fit.call_args[0][2] == gen.layout.split_right_left
 
     @patch("processors.insert_image_fit")
     def test_center_comment(self, mock_fit, gen, tmp_path, png_file):
         """<!-- layout: center --> で画像が中央に配置される"""
         md = f"## 見出し\n\n本文\n\n<!-- layout: center -->\n\n![img]({png_file})\n"
         gen.generate(md, str(tmp_path / "out.pptx"))
-        assert mock_fit.call_args[0][2] == Inches(1.0)
+        assert mock_fit.call_args[0][2] == gen.layout.content_left
 
     def test_layout_is_reset_on_new_slide(self, gen, tmp_path):
         """新しい見出しでレイアウト指定はリセットされる"""

@@ -100,10 +100,17 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     # デフォルト枠のはみ出し補正
     if not generator.slides_conf.get('template_path'):
         try:
+            layout = generator.layout
             body_shape = generator.current_slide.placeholders[1]
-            o_left, o_top, o_width = body_shape.left, body_shape.top, body_shape.width
-            new_height = generator.layout.body_height_for(o_top)
-            body_shape.left, body_shape.top, body_shape.width, body_shape.height = o_left, o_top, o_width, new_height
+            # 継承値は書き込む前にすべて読み出す。一部だけ書き換えると継承が切れ、
+            # 残りの値が0になってしまうため（shrink_body_shape の注意書きも参照）
+            original_top = body_shape.top
+            # 本文枠をコンテンツ領域に合わせ、画像・表と左右の端を揃える
+            # （プレースホルダーは画角を変えても追従しないので、ここで合わせる）
+            body_shape.left = layout.content_left
+            body_shape.top = original_top
+            body_shape.width = layout.content_width
+            body_shape.height = layout.body_height_for(original_top)
         except Exception:
             pass
 
@@ -158,11 +165,13 @@ def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
     
     if not generator.slides_conf.get('template_path'):
         try:
+            layout = generator.layout
             body_shape = generator.current_slide.placeholders[1]
-            o_left, o_top, o_width = body_shape.left, body_shape.top, body_shape.width
             new_top = Inches(0.5)
-            new_height = generator.layout.body_height_for(new_top)
-            body_shape.left, body_shape.top, body_shape.width, body_shape.height = o_left, new_top, o_width, new_height
+            body_shape.left = layout.content_left
+            body_shape.top = new_top
+            body_shape.width = layout.content_width
+            body_shape.height = layout.body_height_for(new_top)
         except Exception:
             pass
 
@@ -210,15 +219,15 @@ def append_code_textbox(
     layout = generator.layout
 
     if generator.slide_has_text or generator.forced_layout == '2-column':
-        shrink_body_shape(generator.current_slide, layout.code_split_body_width)
-        box = (layout.code_split_left, layout.content_top,
-               layout.code_split_width, layout.content_height)
+        shrink_body_shape(generator.current_slide, layout.split_body_width)
+        box = (layout.split_right_left, layout.content_top,
+               layout.split_right_width, layout.content_height)
     elif generator.forced_layout == 'center':
-        box = (layout.code_center_left, layout.content_top,
-               layout.code_center_width, layout.content_height)
+        box = (layout.center_left, layout.content_top,
+               layout.center_width, layout.content_height)
     else:
-        box = (layout.content_left, layout.code_full_top,
-               layout.content_width, layout.code_full_height)
+        box = (layout.content_left, layout.content_top,
+               layout.content_width, layout.content_height)
 
     theme = generator.config.get('theme') or {}
     create_code_textbox(
@@ -264,8 +273,8 @@ def place_image_split(generator: PPTXGenerator, img_data: ImageSource) -> Pictur
     shrink_body_shape(generator.current_slide, layout.split_body_width)
     return place_image(
         generator, img_data,
-        layout.split_image_left, layout.content_top,
-        layout.split_image_width, layout.content_height,
+        layout.split_right_left, layout.content_top,
+        layout.split_right_width, layout.content_height,
     )
 
 def load_image(src: str) -> ImageSource:

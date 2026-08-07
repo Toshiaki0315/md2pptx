@@ -1,11 +1,11 @@
-"""スライドサイズから各要素の配置寸法を導出する
+"""スライドの配置寸法を導出する
 
-従来は 16:9（10 × 5.625インチ）を前提とした絶対値が processors / utils に散在しており、
-config.yaml で `4:3` や `A4` を選んでも本文の高さ以外は追従しなかった。
-ここでスライドサイズから寸法を導出し、どの画角でも同じ見た目になるようにする。
+配置の基準は**本文プレースホルダー**とする。タイトルも本文もテンプレートが
+定めた位置にあるため、画像や表だけが別の余白で配置されると左端が揃わない。
+プレースホルダーに合わせることで、社内テンプレートを使う場合も
+そのテンプレートの設計どおりに揃う。
 
-各係数は **16:9 のときに従来とまったく同じ寸法になるよう較正**してある
-（テスト TestSlideLayout で 16:9 の実測値との一致を検証している）。
+プレースホルダーが取得できない場合は、スライドサイズからの既定値にフォールバックする。
 """
 
 from __future__ import annotations
@@ -14,66 +14,80 @@ from dataclasses import dataclass
 
 from pptx.util import Emu, Inches, Length
 
-# --- 余白（絶対値）---
+# --- プレースホルダーが取得できない場合の既定値（絶対値） ---
 # 余白は「紙面が大きくなっても広げない」ほうが自然なため、割合ではなく絶対値で持つ。
 
 #: 左右の余白
-SIDE_MARGIN_INCHES = 1.0
-#: コンテンツ領域の上端（タイトルプレースホルダーの下端に相当）
-CONTENT_TOP_INCHES = 1.5
-#: コンテンツ領域の下端余白
-BOTTOM_MARGIN_INCHES = 0.325
-#: 本文プレースホルダーの下端余白
-BODY_BOTTOM_MARGIN_INCHES = 0.5
-#: 2カラム時、図の右端に残す余白
-SPLIT_RIGHT_MARGIN_INCHES = 0.3
+SIDE_MARGIN_INCHES = 0.5
+#: コンテンツ領域の上端（タイトル領域の下端に相当）
+CONTENT_TOP_INCHES = 1.75
 
-# --- 分割比（スライド幅・コンテンツ領域に対する割合）---
+#: コンテンツ領域および本文枠の下端に残す余白
+BOTTOM_MARGIN_INCHES = 0.5
 
-#: 2カラム時の本文枠の幅
-SPLIT_BODY_WIDTH_RATIO = 0.48
-#: 2カラム時の図の左端
-SPLIT_IMAGE_LEFT_RATIO = 0.52
+# --- 分割 ---
 
-#: コードブロックを右に置くときの本文枠の幅
-CODE_SPLIT_BODY_WIDTH_RATIO = 0.45
-#: 同、コード枠の左端
-CODE_SPLIT_LEFT_RATIO = 0.50
-#: 中央寄せレイアウト時のコード枠の左端と幅
-CODE_CENTER_LEFT_RATIO = 0.15
-CODE_CENTER_WIDTH_RATIO = 0.70
-#: 全幅レイアウト時、コード枠をコンテンツ領域より少し内側に置くための調整値
-CODE_FULL_TOP_OFFSET_INCHES = 0.5
-CODE_FULL_HEIGHT_REDUCTION_INCHES = 0.8
+#: 左右に分割するときの、本文と図の間隔
+SPLIT_GUTTER_INCHES = 0.3
 
-#: テキストと表を上下に分割するときの比率（コンテンツ領域の高さに対する割合）
-TABLE_SPLIT_TOP_RATIO = 1.3 / 3.8
-TABLE_SPLIT_BODY_HEIGHT_RATIO = 2.0 / 3.8
+#: テキストの下に表を置くときの、本文が使える高さの割合
+TABLE_SPLIT_BODY_HEIGHT_RATIO = 0.35
+#: 同、本文と表の間隔
+TABLE_SPLIT_GUTTER_INCHES = 0.15
+
+#: 中央寄せレイアウトで、コンテンツ領域の左右をさらに詰める割合
+CENTER_INSET_RATIO = 0.1
+
 
 @dataclass(frozen=True)
 class SlideLayout:
-    """スライドサイズに応じた配置寸法（すべてEMU）"""
+    """スライドに応じた配置寸法（すべてEMU）
+
+    body_* は本文プレースホルダーの位置・大きさ。取得できない場合は None とし、
+    スライドサイズからの既定値を用いる。
+    """
 
     width: Length
     height: Length
+    body_left: Length | None = None
+    body_top: Length | None = None
+    body_width: Length | None = None
 
     @classmethod
     def from_presentation(cls, prs) -> SlideLayout:
-        return cls(Emu(int(prs.slide_width)), Emu(int(prs.slide_height)))
+        left = top = body_width = None
+        try:
+            body = prs.slide_layouts[1].placeholders[1]
+            left = Emu(int(body.left))
+            top = Emu(int(body.top))
+            body_width = Emu(int(body.width))
+        except Exception:
+            # 本文プレースホルダーを持たないテンプレートでは既定値を使う
+            pass
 
-    # --- コンテンツ領域（画像・表を置ける範囲）---
+        return cls(
+            Emu(int(prs.slide_width)), Emu(int(prs.slide_height)), left, top, body_width
+        )
+
+    # --- コンテンツ領域（画像・表・コード枠を置ける範囲） ---
 
     @property
     def content_left(self) -> Length:
-        return Inches(SIDE_MARGIN_INCHES)
+        return self.body_left if self.body_left is not None else Inches(SIDE_MARGIN_INCHES)
 
     @property
     def content_top(self) -> Length:
-        return Inches(CONTENT_TOP_INCHES)
+        return self.body_top if self.body_top is not None else Inches(CONTENT_TOP_INCHES)
 
     @property
     def content_width(self) -> Length:
-        return Emu(int(self.width - Inches(SIDE_MARGIN_INCHES) * 2))
+        """コンテンツ領域の幅（左余白を右側にも同じだけ取る）
+
+        プレースホルダーの幅をそのまま使わないのは、既定テンプレートの
+        プレースホルダーがスライドサイズを変えても追従しないため。
+        左余白だけを基準にすることで、A4など横長の画角でも紙面を使い切る。
+        """
+        return Emu(int(self.width - self.content_left * 2))
 
     @property
     def content_height(self) -> Length:
@@ -83,66 +97,45 @@ class SlideLayout:
 
     def body_height_for(self, top: Length) -> Length:
         """本文枠がスライド下端からはみ出さない高さ"""
-        return Emu(int(self.height - top - Inches(BODY_BOTTOM_MARGIN_INCHES)))
+        return Emu(int(self.height - top - Inches(BOTTOM_MARGIN_INCHES)))
+
+    # --- 左右分割（本文と、図またはコード枠） ---
 
     @property
     def split_body_width(self) -> Length:
-        """図・表と横に並べるときの本文枠の幅"""
-        return Emu(int(self.width * SPLIT_BODY_WIDTH_RATIO))
+        """図・表と横に並べるときの本文枠の幅（コンテンツ領域を等分する）"""
+        return Emu(int((self.content_width - Inches(SPLIT_GUTTER_INCHES)) / 2))
 
     @property
-    def code_split_body_width(self) -> Length:
-        """コード枠と横に並べるときの本文枠の幅"""
-        return Emu(int(self.width * CODE_SPLIT_BODY_WIDTH_RATIO))
-
-    # --- 図（画像・Mermaid）---
+    def split_right_left(self) -> Length:
+        """左右分割で右側に置く要素の左端"""
+        return Emu(int(self.content_left + self.split_body_width + Inches(SPLIT_GUTTER_INCHES)))
 
     @property
-    def split_image_left(self) -> Length:
-        return Emu(int(self.width * SPLIT_IMAGE_LEFT_RATIO))
+    def split_right_width(self) -> Length:
+        """同、右側に置く要素の幅（右端はコンテンツ領域の右端に揃う）"""
+        return Emu(int(self.content_left + self.content_width - self.split_right_left))
 
-    @property
-    def split_image_width(self) -> Length:
-        return Emu(
-            int(self.width - Inches(SPLIT_RIGHT_MARGIN_INCHES) - self.split_image_left)
-        )
-
-    # --- 表 ---
-
-    @property
-    def table_split_top(self) -> Length:
-        """テキストの下に表を置くときの表の上端"""
-        return Emu(int(self.content_top + self.content_height * TABLE_SPLIT_TOP_RATIO))
+    # --- 上下分割（テキストと表） ---
 
     @property
     def table_split_body_height(self) -> Length:
         """表と上下に並べるときの本文枠の高さ"""
         return Emu(int(self.content_height * TABLE_SPLIT_BODY_HEIGHT_RATIO))
 
-    # --- コードブロック枠 ---
+    @property
+    def table_split_top(self) -> Length:
+        """テキストの下に表を置くときの表の上端（本文枠と重ならない位置）"""
+        return Emu(int(
+            self.content_top + self.table_split_body_height + Inches(TABLE_SPLIT_GUTTER_INCHES)
+        ))
+
+    # --- 中央寄せ ---
 
     @property
-    def code_split_left(self) -> Length:
-        return Emu(int(self.width * CODE_SPLIT_LEFT_RATIO))
+    def center_left(self) -> Length:
+        return Emu(int(self.content_left + self.content_width * CENTER_INSET_RATIO))
 
     @property
-    def code_split_width(self) -> Length:
-        return Emu(int(self.width * (1 - CODE_SPLIT_LEFT_RATIO) - Inches(0.5)))
-
-    @property
-    def code_center_left(self) -> Length:
-        return Emu(int(self.width * CODE_CENTER_LEFT_RATIO))
-
-    @property
-    def code_center_width(self) -> Length:
-        return Emu(int(self.width * CODE_CENTER_WIDTH_RATIO))
-
-    @property
-    def code_full_top(self) -> Length:
-        return Emu(int(self.content_top + Inches(CODE_FULL_TOP_OFFSET_INCHES)))
-
-    @property
-    def code_full_height(self) -> Length:
-        return Emu(
-            int(self.content_height - Inches(CODE_FULL_HEIGHT_REDUCTION_INCHES))
-        )
+    def center_width(self) -> Length:
+        return Emu(int(self.content_width * (1 - CENTER_INSET_RATIO * 2)))
