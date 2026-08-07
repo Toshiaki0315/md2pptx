@@ -29,6 +29,7 @@ from pygments.lexers import get_lexer_by_name, guess_lexer
 from pygments.styles import get_style_by_name
 
 if TYPE_CHECKING:
+    from pptx.shapes.base import BaseShape
     from pptx.shapes.picture import Picture
     from pptx.slide import Slide
     from pptx.text.text import TextFrame, _Paragraph, _Run
@@ -186,6 +187,16 @@ def insert_image_fit(
     pic.left = Emu(int(left + (max_width - pic.width) / 2))
     pic.top = Emu(int(top + (max_height - pic.height) / 2))
     return pic
+
+def set_alt_text(shape: BaseShape, text: str) -> None:
+    """図形に代替テキスト（スクリーンリーダー用の説明）を設定する
+
+    python-pptx には代替テキストの公開APIが無いため、
+    XMLの descr 属性を直接書き換える。
+    """
+    if not text:
+        return
+    shape._element._nvXxPr.cNvPr.set('descr', text)
 
 def add_runs_from_tag(
     element: Tag,

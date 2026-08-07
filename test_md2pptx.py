@@ -20,6 +20,7 @@ from PIL import Image
 from bs4 import BeautifulSoup
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Inches, Pt
 
 import md2pptx
@@ -56,6 +57,7 @@ from processors import (
 )
 from utils import (
     DEFAULT_IMAGE_DPI,
+    set_alt_text,
     add_runs_from_tag,
     append_text_block,
     create_code_textbox,
@@ -454,6 +456,25 @@ class TestUtilsArePure:
 
         append_text_block(text_frame, parse_md("本文").find("p"), reuse_first_paragraph=True)
         assert text_frame.paragraphs[0].runs[0].text == "本文"
+
+    def test_set_alt_text(self):
+        """図形に代替テキストを設定できる"""
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(2), Inches(1))
+
+        set_alt_text(box, "説明文")
+        assert box._element._nvXxPr.cNvPr.get("descr") == "説明文"
+
+    def test_set_alt_text_ignores_empty(self):
+        """空文字を渡した場合は既存の値を書き換えない"""
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(2), Inches(1))
+        set_alt_text(box, "元の説明")
+
+        set_alt_text(box, "")
+        assert box._element._nvXxPr.cNvPr.get("descr") == "元の説明"
 
     def test_create_code_textbox_takes_a_slide(self):
         """スライドと寸法を渡すだけでコード枠を作れる"""
@@ -956,6 +977,38 @@ class TestProcessImage:
             Inches(8.0),
         )
 
+    def _pictures_of(self, slide):
+        return [
+            s for s in slide.shapes
+            if s.shape_type is not None and "PICTURE" in str(s.shape_type)
+        ]
+
+    def test_alt_text_is_carried_over(self, gen_with_slide, png_file):
+        """Markdownの代替テキストが図形の説明として設定される"""
+        tag = parse_html(f'<img src="{png_file}" alt="システム構成図">').img
+        process_image(gen_with_slide, tag)
+
+        picture = self._pictures_of(gen_with_slide.current_slide)[0]
+        assert picture._element._nvXxPr.cNvPr.get("descr") == "システム構成図"
+
+    def test_alt_text_for_fixed_position(self, base_config, png_file):
+        """position_inches で配置した画像にも代替テキストが付く"""
+        base_config["images"]["position_inches"] = [1.0, 1.0]
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        process_image(gen, parse_html(f'<img src="{png_file}" alt="固定配置の図">').img)
+
+        picture = self._pictures_of(gen.current_slide)[0]
+        assert picture._element._nvXxPr.cNvPr.get("descr") == "固定配置の図"
+
+    def test_without_alt_the_default_is_kept(self, gen_with_slide, png_file):
+        """alt が無い場合は python-pptx の既定値のままにする"""
+        process_image(gen_with_slide, parse_html(f'<img src="{png_file}">').img)
+
+        picture = self._pictures_of(gen_with_slide.current_slide)[0]
+        assert picture._element._nvXxPr.cNvPr.get("descr") != ""
+
     def test_missing_src_is_skipped(self, gen_with_slide, capsys):
         """src属性が無い画像は警告を出してスキップする"""
         process_image(gen_with_slide, parse_html("<img>").img)
@@ -1022,6 +1075,39 @@ class TestProcessTable:
         shape = [s for s in gen_with_slide.current_slide.shapes if s.has_table][0]
         assert shape.top == Inches(2.8)
         assert gen_with_slide.current_slide.placeholders[1].height == Inches(2.0)
+
+    def test_column_alignment_is_applied(self, gen_with_slide):
+        """Markdownの列揃え指定（:---: など）がセルに反映される"""
+        md = "| 左 | 中央 | 右 |\n| :--- | :---: | ---: |\n| a | b | c |"
+        process_table(gen_with_slide, parse_md(md).find("table"))
+        table = [s for s in gen_with_slide.current_slide.shapes if s.has_table][0].table
+
+        expected = [PP_ALIGN.LEFT, PP_ALIGN.CENTER, PP_ALIGN.RIGHT]
+        for row_idx in range(2):  # 見出し行と本文行の両方
+            actual = [
+                table.cell(row_idx, col).text_frame.paragraphs[0].alignment for col in range(3)
+            ]
+            assert actual == expected
+
+    def test_without_alignment_powerpoint_default_is_used(self, gen_with_slide):
+        """列揃えの指定が無い場合はPowerPointの既定に任せる"""
+        process_table(gen_with_slide, parse_md(self.MD_TABLE).find("table"))
+        table = [s for s in gen_with_slide.current_slide.shapes if s.has_table][0].table
+        assert table.cell(0, 0).text_frame.paragraphs[0].alignment is None
+
+    @pytest.mark.parametrize(
+        "html, expected",
+        [
+            ('<td style="text-align: center;">a</td>', PP_ALIGN.CENTER),
+            ('<td style="text-align:right">a</td>', PP_ALIGN.RIGHT),
+            ('<td align="left">a</td>', PP_ALIGN.LEFT),  # 古いmarkdownの出力形式
+            ('<td>a</td>', None),
+            ('<td style="color: red;">a</td>', None),
+        ],
+    )
+    def test_cell_alignment_parsing(self, html, expected):
+        """揃え指定の解釈（style属性・align属性の両方に対応する）"""
+        assert processors.cell_alignment(parse_html(html).td) is expected
 
     def test_layout_is_full_when_slide_is_empty(self, gen_with_slide):
         """テキストが無い場合は表を上部から配置する"""
