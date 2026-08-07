@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import datetime
 import requests
 from io import BytesIO
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from bs4 import BeautifulSoup, Tag
 from pptx.enum.text import PP_ALIGN
@@ -52,6 +53,26 @@ NOTE_BLOCK_TAGS = ['p', 'li']
 # 箇条書きのインデントレベルの上限（PowerPointの仕様）
 MAX_BULLET_LEVEL = 8
 
+# <!-- layout: ... --> で指定できる配置。カンマ区切りで併記できる
+PLACEMENT_DIRECTIVES = ('2-column', 'center', 'full-image')
+
+# 同、配色の指定（配置とは別軸なので併記できるようにしている）
+DARK_THEME_DIRECTIVE = 'dark-theme'
+
+# ダークテーマの既定色
+DEFAULT_DARK_BACKGROUND = [30, 30, 30]
+DEFAULT_DARK_TEXT = [240, 240, 240]
+
+# フッター（日付・任意テキスト・ページ番号）の既定の書式
+DEFAULT_FOOTER_FONT: FontConfig = {'size_pt': 14, 'color_rgb': [128, 128, 128]}
+
+# フッターを置く帯の高さと、左右の余白
+FOOTER_HEIGHT_INCHES = 0.3
+FOOTER_MARGIN_INCHES = 0.5
+
+# 日付の既定の書式
+DEFAULT_DATE_FORMAT = '%Y-%m-%d'
+
 # 画像を横一列に並べる上限の枚数（これを超えたらグリッド配置にする）
 MAX_IMAGES_IN_A_ROW = 3
 
@@ -88,8 +109,7 @@ CELL_MARGIN_V_PT = 0.05 * 72
 
 def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     """見出しタグの処理とスライド作成"""
-    if generator.current_slide:
-        auto_shrink_text(generator.current_slide)
+    finalize_slide(generator)
         
     layout_idx = 0 if tag.name == 'h1' else 1
     generator.current_slide = generator.prs.slides.add_slide(generator.prs.slide_layouts[layout_idx])
@@ -111,6 +131,7 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     generator.current_body.text = "" 
     generator.slide_has_text = False
     generator.current_images = []
+    generator.dark_slide = False
 
     # デフォルト枠のはみ出し補正
     if not generator.slides_conf.get('template_path'):
@@ -172,10 +193,8 @@ def process_h3(generator: PPTXGenerator, tag: Tag) -> None:
 
 def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
     """水平線（---）による新しいスライド（タイトルなし）の生成"""
-    if generator.current_slide:
-        from utils import auto_shrink_text
-        auto_shrink_text(generator.current_slide)
-        
+    finalize_slide(generator)
+
     generator.current_slide = generator.prs.slides.add_slide(generator.prs.slide_layouts[1])
     
     # タイトルシェイプを削除して上部から広く使えるようにする
@@ -192,6 +211,7 @@ def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
     generator.current_body.text = "" 
     generator.slide_has_text = False
     generator.current_images = []
+    generator.dark_slide = False
 
     if not generator.slides_conf.get('template_path'):
         try:
@@ -297,6 +317,17 @@ def place_image_full(generator: PPTXGenerator, img_data: ImageSource) -> Picture
         layout.content_left, layout.content_top, layout.content_width, layout.content_height,
     )
 
+def place_image_bleed(generator: PPTXGenerator, img_data: ImageSource) -> Picture:
+    """スライド全面に図を配置する（<!-- layout: full-image -->）
+
+    余白を取らずスライドいっぱいに広げる。縦横比は保つため、
+    比率が合わない場合は上下または左右に余白が残る。
+    """
+    return place_image(
+        generator, img_data,
+        Emu(0), Emu(0), generator.prs.slide_width, generator.prs.slide_height,
+    )
+
 def place_image_split(generator: PPTXGenerator, img_data: ImageSource) -> Picture:
     """本文枠を左に縮め、図を右半分に配置する（2カラム）"""
     layout = generator.layout
@@ -306,6 +337,117 @@ def place_image_split(generator: PPTXGenerator, img_data: ImageSource) -> Pictur
         layout.split_right_left, layout.content_top,
         layout.split_right_width, layout.content_height,
     )
+
+def apply_layout_directives(generator: PPTXGenerator, value: str) -> None:
+    """<!-- layout: ... --> の指定を解釈する
+
+    配置（2-column / center / full-image）と配色（dark-theme）は別軸のため、
+    カンマ区切りで併記できる。例: `<!-- layout: 2-column, dark-theme -->`
+    """
+    for directive in (item.strip().lower() for item in value.split(',')):
+        if not directive:
+            continue
+        if directive == DARK_THEME_DIRECTIVE:
+            generator.dark_slide = True
+        elif directive in PLACEMENT_DIRECTIVES:
+            generator.forced_layout = directive
+            if directive == '2-column':
+                # 画像や表を右側に寄せるためのフラグ
+                generator.slide_has_text = True
+        else:
+            print(f"Warning: 不明なレイアウト指定 '{directive}' を無視しました。")
+
+def apply_dark_theme(generator: PPTXGenerator) -> None:
+    """スライドの背景を暗くし、プレースホルダーの文字を明るくする
+
+    コードブロックの枠や表は独自の配色を持つため対象にしない。
+    """
+    slide = generator.current_slide
+    if slide is None:
+        return
+
+    theme = generator.config.get('theme') or {}
+    background = theme.get('dark_background_color', DEFAULT_DARK_BACKGROUND)
+    text_color = theme.get('dark_text_color', DEFAULT_DARK_TEXT)
+
+    slide.background.fill.solid()
+    slide.background.fill.fore_color.rgb = RGBColor(*background)
+
+    for shape in slide.shapes:
+        if not (shape.is_placeholder and shape.has_text_frame):
+            continue
+        for paragraph in shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                run.font.color.rgb = RGBColor(*text_color)
+
+def finalize_slide(generator: PPTXGenerator) -> None:
+    """スライドを離れる前の仕上げ
+
+    本文の自動縮小と、指定されていればダークテーマの適用を行う。
+    配色は本文が出そろってから当てる必要があるため、ここでまとめて行う。
+    """
+    if generator.current_slide is None:
+        return
+    auto_shrink_text(generator.current_slide)
+    if generator.dark_slide:
+        apply_dark_theme(generator)
+
+def footer_date_text(setting: Any) -> str:
+    """フッターに出す日付の文字列を返す
+
+    true を指定した場合は変換した日付、文字列を指定した場合はその値をそのまま使う。
+    """
+    if setting is True:
+        return datetime.now().strftime(DEFAULT_DATE_FORMAT)
+    return str(setting) if setting else ''
+
+def add_footer_text(
+    generator: PPTXGenerator, slide: Any, text: str, alignment: PP_ALIGN, column: int
+) -> None:
+    """スライド下部に1つぶんのフッター要素を置く（左・中央・右の3分割）"""
+    if not text:
+        return
+
+    margin = Inches(FOOTER_MARGIN_INCHES)
+    band_width = Emu(int((generator.prs.slide_width - margin * 2) / 3))
+    box = slide.shapes.add_textbox(
+        Emu(int(margin + band_width * column)),
+        Emu(int(generator.prs.slide_height - Inches(FOOTER_HEIGHT_INCHES) - Inches(0.1))),
+        band_width,
+        Inches(FOOTER_HEIGHT_INCHES),
+    )
+    paragraph = box.text_frame.paragraphs[0]
+    paragraph.alignment = alignment
+    run = paragraph.add_run()
+    run.text = text
+    apply_font_style(run, {**DEFAULT_FOOTER_FONT, **(generator.fonts_conf.get('footer') or {})})
+
+def add_slide_footers(generator: PPTXGenerator) -> None:
+    """全スライドの下部に日付・フッター文言・ページ番号を挿入する
+
+    PowerPointの慣習に合わせ、左に日付、中央に文言、右にページ番号を置く。
+    先頭（タイトル）スライドは既定では対象外。
+    """
+    slides_conf = generator.slides_conf
+    footer_conf = slides_conf.get('footer') or {}
+    show_number = slides_conf.get('show_slide_number', True)
+    date_text = footer_date_text(footer_conf.get('date'))
+    footer_text = str(footer_conf.get('text') or '')
+    show_on_title = bool(footer_conf.get('show_on_title', False))
+
+    if not (show_number or date_text or footer_text):
+        return
+
+    for index, slide in enumerate(generator.prs.slides):
+        is_title_slide = index == 0
+        if is_title_slide and not show_on_title:
+            continue
+
+        add_footer_text(generator, slide, date_text, PP_ALIGN.LEFT, 0)
+        add_footer_text(generator, slide, footer_text, PP_ALIGN.CENTER, 1)
+        # 表紙にはページ番号を振らない（本編を1ページ目として数える）
+        if show_number and not is_title_slide:
+            add_footer_text(generator, slide, str(index), PP_ALIGN.RIGHT, 2)
 
 def image_grid(count: int) -> tuple[int, int]:
     """画像の枚数から (列数, 行数) を決める
@@ -329,11 +471,19 @@ def arrange_images(generator: PPTXGenerator) -> None:
         return
 
     layout = generator.layout
-    if generator.slide_has_text or generator.forced_layout == '2-column':
+    area_left: Length
+    area_top: Length
+    area_width: Length
+    area_height: Length
+    if generator.forced_layout == 'full-image':
+        area_left, area_top = Emu(0), Emu(0)
+        area_width, area_height = generator.prs.slide_width, generator.prs.slide_height
+    elif generator.slide_has_text or generator.forced_layout == '2-column':
         area_left, area_width = layout.split_right_left, layout.split_right_width
+        area_top, area_height = layout.content_top, layout.content_height
     else:
         area_left, area_width = layout.content_left, layout.content_width
-    area_top, area_height = layout.content_top, layout.content_height
+        area_top, area_height = layout.content_top, layout.content_height
 
     columns, rows = image_grid(len(images))
     gutter = Inches(IMAGE_GUTTER_INCHES)
@@ -378,6 +528,8 @@ def process_image(generator: PPTXGenerator, tag: Tag) -> None:
             picture = generator.current_slide.shapes.add_picture(
                 img_data, Inches(pos[0]), Inches(pos[1]), height=fixed_height
             )
+        elif generator.forced_layout == 'full-image':
+            picture = place_image_bleed(generator, img_data)
         elif generator.forced_layout == 'center':
             picture = place_image_full(generator, img_data)
         else:

@@ -23,9 +23,12 @@ from typing import Any
 #: 最上位で認識するキー
 KNOWN_TOP_LEVEL = ('slides', 'fonts', 'images', 'theme', 'mermaid')
 
-KNOWN_SLIDES = ('template_path', 'layout', 'show_slide_number', 'h3_as')
+KNOWN_SLIDES = ('template_path', 'layout', 'show_slide_number', 'h3_as', 'footer')
 KNOWN_IMAGES = ('default_height_inches', 'position_inches', 'downscale', 'dpi')
-KNOWN_THEME = ('accent_color', 'text_color', 'code_bg_color')
+KNOWN_THEME = (
+    'accent_color', 'text_color', 'code_bg_color',
+    'dark_background_color', 'dark_text_color',
+)
 KNOWN_MERMAID = (
     'renderer', 'endpoint', 'warn_on_external', 'fallback_to_public', 'cli_path',
 )
@@ -36,9 +39,12 @@ KNOWN_FONT_FIELDS = ('name', 'size_pt', 'bold', 'color_rgb')
 #: コードが参照するフォント設定のキー（bullet_level_N / ordered_level_N は別途パターンで判定）
 KNOWN_FONT_KEYS = (
     'title', 'title_h1', 'title_h2', 'title_h3', 'body',
-    'inline_code', 'code_block', 'table_header', 'table_body',
+    'inline_code', 'code_block', 'table_header', 'table_body', 'footer',
 )
 BULLET_LEVEL_PATTERN = re.compile(r'^(bullet|ordered)_level_\d+$')
+
+#: フッターの項目
+KNOWN_FOOTER = ('text', 'date', 'show_on_title')
 
 #: 選択肢が決まっている項目
 VALID_LAYOUTS = ('16:9', '4:3', '16:10', 'A4')
@@ -151,6 +157,7 @@ def _validate_slides(conf: Any, result: ValidationResult) -> None:
         _check_str('slides.template_path', conf['template_path'], result)
     if conf.get('show_slide_number') is not None:
         _check_bool('slides.show_slide_number', conf['show_slide_number'], result)
+    _validate_footer(conf.get('footer'), result)
     if conf.get('h3_as') is not None:
         h3_as = conf['h3_as']
         if h3_as not in VALID_H3_AS:
@@ -160,6 +167,23 @@ def _validate_slides(conf: Any, result: ValidationResult) -> None:
                 f"{_suggestion(str(h3_as), VALID_H3_AS)}"
             )
 
+
+def _validate_footer(conf: Any, result: ValidationResult) -> None:
+    if not _check_mapping('slides.footer', conf, result):
+        return
+    _check_unknown_keys('slides.footer.', conf, KNOWN_FOOTER, result)
+
+    if conf.get('text') is not None:
+        _check_str('slides.footer.text', conf['text'], result)
+    if conf.get('show_on_title') is not None:
+        _check_bool('slides.footer.show_on_title', conf['show_on_title'], result)
+
+    date = conf.get('date')
+    if date is not None and not isinstance(date, (bool, str)):
+        result.errors.append(
+            "slides.footer.date: true（変換日を表示）か、表示したい文字列で"
+            f"指定してください（{_describe(date)}）"
+        )
 
 def _validate_fonts(conf: Any, result: ValidationResult) -> None:
     if not _check_mapping('fonts', conf, result):

@@ -14,6 +14,9 @@ from layout import SlideLayout
 from utils import FontConfig, apply_font_style
 
 from processors import (
+    add_slide_footers,
+    apply_layout_directives,
+    finalize_slide,
     process_heading,
     process_h3,
     process_hr,
@@ -48,6 +51,8 @@ class PPTXGenerator:
         self.current_images: list[Any] = []
         self.slide_has_text: bool = False
         self.forced_layout: str | None = None
+        # このスライドをダークテーマにするか（<!-- layout: dark-theme -->）
+        self.dark_slide: bool = False
 
         self._init_presentation()
 
@@ -132,10 +137,7 @@ class PPTXGenerator:
             if isinstance(element, Comment):
                 text = element.strip()
                 if text.startswith('layout:'):
-                    layout_val = text.split(':', 1)[1].strip()
-                    self.forced_layout = layout_val
-                    if layout_val == '2-column':
-                        self.slide_has_text = True # 画像や表を右側に寄せるためのフラグ
+                    apply_layout_directives(self, text.split(':', 1)[1])
                 continue
 
             if not isinstance(element, Tag) or element.name not in TARGET_TAGS:
@@ -170,30 +172,9 @@ class PPTXGenerator:
             elif tag.name in ['li', 'p'] and self.current_body:
                 process_text(self, tag)
 
-        if self.current_slide:
-            from utils import auto_shrink_text
-            auto_shrink_text(self.current_slide)
+        finalize_slide(self)
             
-        # スライド番号の自動挿入 (Task 4)
-        if self.slides_conf.get('show_slide_number', True):
-            from pptx.enum.text import PP_ALIGN
-            from pptx.util import Pt
-            from pptx.dml.color import RGBColor
-            
-            for i, slide in enumerate(self.prs.slides):
-                if i == 0: continue # タイトルスライドは除外
-                
-                left = self.prs.slide_width - Inches(1.0)
-                top = self.prs.slide_height - Inches(0.5)
-                width = Inches(0.8)
-                height = Inches(0.3)
-                
-                txBox = slide.shapes.add_textbox(left, top, width, height)
-                p = txBox.text_frame.paragraphs[0]
-                p.alignment = PP_ALIGN.RIGHT
-                run = p.add_run()
-                run.text = str(i)
-                run.font.size = Pt(14)
-                run.font.color.rgb = RGBColor(128, 128, 128)
-            
+        # 日付・フッター文言・ページ番号をまとめて挿入する
+        add_slide_footers(self)
+
         self.prs.save(output_file)
