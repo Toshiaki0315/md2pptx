@@ -849,6 +849,44 @@ class TestProcessBlockquote:
         notes = gen_with_slide.current_slide.notes_slide.notes_text_frame.text
         assert notes == "1つ目\n\n2つ目"
 
+    def test_paragraphs_keep_their_separation(self, gen_with_slide):
+        """引用内の段落が区切りなく連結されない
+
+        get_text() をそのまま使っていた頃は
+        「1段落目です。2段落目です。」のように繋がっていた。
+        """
+        md = "> 1段落目です。\n>\n> 2段落目です。\n"
+        process_blockquote(gen_with_slide, parse_md(md).find("blockquote"))
+
+        notes = gen_with_slide.current_slide.notes_slide.notes_text_frame.text
+        assert notes == "1段落目です。\n\n2段落目です。"
+
+    def test_line_breaks_within_a_paragraph_are_kept(self, gen_with_slide):
+        """同じ段落内の改行は維持される（発表原稿の体裁を保つため）"""
+        md = "> 1行目です。\n> 2行目です。\n"
+        process_blockquote(gen_with_slide, parse_md(md).find("blockquote"))
+
+        notes = gen_with_slide.current_slide.notes_slide.notes_text_frame.text
+        assert notes == "1行目です。\n2行目です。"
+
+    def test_list_items_become_separate_lines(self, gen_with_slide):
+        """引用内の箇条書きは項目ごとに改行される"""
+        md = "> 発表のポイント\n>\n> * 最初の3分で説明する\n> * 質問は別紙を参照\n"
+        process_blockquote(gen_with_slide, parse_md(md).find("blockquote"))
+
+        notes = gen_with_slide.current_slide.notes_slide.notes_text_frame.text
+        assert notes == "発表のポイント\n最初の3分で説明する\n質問は別紙を参照"
+
+    def test_empty_blockquote_is_skipped(self, gen_with_slide):
+        """空の引用ではノートを作らない"""
+        process_blockquote(gen_with_slide, parse_html("<blockquote><p>  </p></blockquote>").blockquote)
+        assert gen_with_slide.current_slide.notes_slide.notes_text_frame.text == ""
+
+    def test_blockquote_without_paragraph(self, gen_with_slide):
+        """pタグを持たない引用でもテキストを取り出せる"""
+        process_blockquote(gen_with_slide, parse_html("<blockquote>直書き</blockquote>").blockquote)
+        assert gen_with_slide.current_slide.notes_slide.notes_text_frame.text == "直書き"
+
 
 class TestProcessImage:
     def test_local_path_is_inserted(self, gen_with_slide, png_file):
@@ -1118,6 +1156,46 @@ class TestProcessText:
 
         process_text(gen, parse_md("* 項目").find("li"))
         assert gen.current_body.paragraphs[0].runs[0].font.size == Pt(18)
+
+    def test_nested_bullets_inherit_the_shallower_level(self, base_config):
+        """未定義の階層は、より浅い階層の設定を引き継ぐ
+
+        body へフォールバックしていた頃は、ネストした途端に
+        書体が bullet_level_1 の指定から body の指定へ変わっていた。
+        """
+        base_config["fonts"]["bullet_level_1"] = {"name": "Yu Gothic", "size_pt": 18}
+        base_config["fonts"]["body"] = {"name": "Meiryo", "size_pt": 24}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        for item in parse_md("* 親\n    * 子\n        * 孫").find_all("li"):
+            process_text(gen, item)
+
+        fonts = [(p.runs[0].font.name, p.runs[0].font.size) for p in gen.current_body.paragraphs]
+        assert fonts == [("Yu Gothic", Pt(18))] * 3
+
+    def test_explicit_deeper_level_wins(self, base_config):
+        """深い階層に個別設定があればそちらが優先される"""
+        base_config["fonts"]["bullet_level_1"] = {"size_pt": 18}
+        base_config["fonts"]["bullet_level_2"] = {"size_pt": 14}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        for item in parse_md("* 親\n    * 子").find_all("li"):
+            process_text(gen, item)
+
+        sizes = [p.runs[0].font.size for p in gen.current_body.paragraphs]
+        assert sizes == [Pt(18), Pt(14)]
+
+    def test_bullet_falls_back_to_body_without_any_config(self, base_config):
+        """箇条書きの設定が一切無い場合は body を使う"""
+        base_config["fonts"].pop("bullet_level_1", None)
+        base_config["fonts"]["body"] = {"size_pt": 22}
+        gen = PPTXGenerator(base_config)
+        process_heading(gen, parse_md("## 見出し").find("h2"))
+
+        process_text(gen, parse_md("* 項目").find("li"))
+        assert gen.current_body.paragraphs[0].runs[0].font.size == Pt(22)
 
 
 # =====================================================================

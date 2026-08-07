@@ -31,6 +31,12 @@ if TYPE_CHECKING:
 # 画像取得（HTTP）のタイムアウト秒数
 HTTP_TIMEOUT_SEC = 15
 
+# スピーカーノートで1つのまとまりとして扱うブロック要素
+NOTE_BLOCK_TAGS = ['p', 'li']
+
+# 箇条書きのインデントレベルの上限（PowerPointの仕様）
+MAX_BULLET_LEVEL = 8
+
 # config.yaml に該当設定が無い場合のコードブロックの既定値
 DEFAULT_CODE_BLOCK_FONT = {'name': 'Consolas', 'size_pt': 12}
 DEFAULT_CODE_BG_COLOR = [40, 44, 52]
@@ -129,10 +135,37 @@ def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
         except Exception:
             pass
 
+def extract_note_text(tag: Tag) -> str:
+    """引用ブロックから、段落構造を保ったままノート用のテキストを取り出す
+
+    tag.get_text() は段落や箇条書きの区切りを落として全体を連結してしまうため、
+    ブロック単位で取り出して改行でつなぐ。
+    """
+    # リスト項目の中の p は、項目側でまとめて扱うため除外する
+    blocks = [
+        block for block in tag.find_all(NOTE_BLOCK_TAGS)
+        if not (block.name == 'p' and block.find_parent('li'))
+    ]
+    if not blocks:
+        return tag.get_text(strip=True)
+
+    parts: list[str] = []
+    for block in blocks:
+        text = block.get_text().strip()
+        if not text:
+            continue
+        if parts:
+            # 箇条書きは詰めて、段落どうしは空行を挟む
+            parts.append('\n' if block.name == 'li' else '\n\n')
+        parts.append(text)
+    return ''.join(parts)
+
 def process_blockquote(generator: PPTXGenerator, tag: Tag) -> None:
     """スピーカーノートの処理"""
     text_frame = generator.current_slide.notes_slide.notes_text_frame
-    note_text = tag.get_text(strip=True)
+    note_text = extract_note_text(tag)
+    if not note_text:
+        return
     text_frame.text = text_frame.text + "\n\n" + note_text if text_frame.text else note_text
 
 def inline_code_conf(generator: PPTXGenerator) -> FontConfig | None:
@@ -315,13 +348,31 @@ def process_code_or_mermaid(generator: PPTXGenerator, tag: Tag) -> None:
     else:
         append_code_textbox(generator, tag.get_text(), language=language)
 
+def bullet_font_conf(fonts_conf: dict[str, FontConfig], level: int) -> FontConfig | None:
+    """指定レベルの箇条書きのフォント設定を返す
+
+    設定が無いレベルは、より浅いレベルの設定を引き継ぐ。
+    いきなり body へフォールバックすると、ネストした途端に書体やサイズが
+    変わってしまうため（body は本文用で、箇条書きとは役割が異なる）。
+    """
+    for candidate in range(level + 1, 0, -1):
+        conf = fonts_conf.get(f'bullet_level_{candidate}')
+        if conf:
+            return conf
+    return fonts_conf.get('body')
+
 def process_text(generator: PPTXGenerator, tag: Tag) -> None:
     """段落・リストの処理"""
     if not tag.get_text(strip=True): return
-    
-    level = min(len(tag.find_parents(['ul', 'ol'])) - 1, 8) if tag.name == 'li' else 0
-    font_conf = generator.fonts_conf.get(f'bullet_level_{level + 1}' if tag.name == 'li' else 'body', generator.fonts_conf.get('body'))
-    
+
+    if tag.name == 'li':
+        level = min(len(tag.find_parents(['ul', 'ol'])) - 1, MAX_BULLET_LEVEL)
+        font_conf = bullet_font_conf(generator.fonts_conf, level)
+    else:
+        level = 0
+        font_conf = generator.fonts_conf.get('body')
+
+
     append_text_block(
         generator.current_body, tag,
         reuse_first_paragraph=not generator.slide_has_text,
