@@ -205,7 +205,17 @@ class TestDownscaleImage:
         img.save(path)
         return str(path)
 
-    def test_large_image_is_resampled(self, tmp_path):
+    @pytest.fixture
+    def ignore_size_guard(self, mocker):
+        """「再エンコードで大きくなるなら元画像を使う」判定を無効化する
+
+        解像度の計算を検証したいテストでは、PNGの圧縮率（環境やPillowの版で
+        変動する）に結果が左右されないよう、この判定を切り離す。
+        判定そのものは test_original_is_kept_when_resize_grows で検証している。
+        """
+        mocker.patch("utils._source_size", return_value=10**9)
+
+    def test_large_image_is_resampled(self, tmp_path, ignore_size_guard):
         """表示サイズに対して過大な画像は縮小される"""
         source = self._png(tmp_path, 1600, 800)
         result = downscale_image(source, Inches(4.0), Inches(3.0), dpi=100)
@@ -233,14 +243,14 @@ class TestDownscaleImage:
         assert isinstance(result, BytesIO)
         assert result.getbuffer().nbytes < os.path.getsize(source)
 
-    def test_dpi_controls_resolution(self, tmp_path):
+    def test_dpi_controls_resolution(self, tmp_path, ignore_size_guard):
         """dpiの指定が出力解像度に反映される"""
         source = self._png(tmp_path, 2000, 1000)
 
         with Image.open(downscale_image(source, Inches(4.0), Inches(3.0), dpi=50)) as low:
             with Image.open(downscale_image(source, Inches(4.0), Inches(3.0), dpi=200)) as high:
-                assert low.width == 200
-                assert high.width == 800
+                assert low.width == 200   # 4.0インチ × 50dpi
+                assert high.width == 800  # 4.0インチ × 200dpi
 
     def test_original_is_kept_when_resize_grows(self, tmp_path, mocker):
         """再エンコードで逆に大きくなる画像（図版など）は元データを使う"""
