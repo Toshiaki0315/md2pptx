@@ -49,9 +49,6 @@ CODE_FULL_HEIGHT_REDUCTION_INCHES = 0.8
 #: テキストと表を上下に分割するときの比率（コンテンツ領域の高さに対する割合）
 TABLE_SPLIT_TOP_RATIO = 1.3 / 3.8
 TABLE_SPLIT_BODY_HEIGHT_RATIO = 2.0 / 3.8
-#: 表を生成するときの初期の高さ（行数に応じてPowerPoint側で伸びる）
-TABLE_ROW_HEIGHT_INCHES = 0.8
-
 
 @dataclass(frozen=True)
 class SlideLayout:
@@ -121,10 +118,6 @@ class SlideLayout:
     def table_split_body_height(self) -> Length:
         """表と上下に並べるときの本文枠の高さ"""
         return Emu(int(self.content_height * TABLE_SPLIT_BODY_HEIGHT_RATIO))
-
-    @property
-    def table_height(self) -> Length:
-        return Inches(TABLE_ROW_HEIGHT_INCHES)
 
     # --- コードブロック枠 ---
 
