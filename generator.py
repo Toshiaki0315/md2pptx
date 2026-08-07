@@ -140,7 +140,12 @@ class PPTXGenerator:
                 continue
 
             tag = element
-            if tag.name == 'p' and (tag.find_parent('li') or tag.find_parent('blockquote')):
+            # 引用の中身はノートとしてまとめて扱うため、本文側では処理しない
+            # （p だけを除いていた頃は、引用内の箇条書きが本文にも出力されていた）
+            if tag.name != 'blockquote' and tag.find_parent('blockquote'):
+                continue
+            # リスト項目の中の p は、項目側でまとめて処理する
+            if tag.name == 'p' and tag.find_parent('li'):
                 continue
 
             if tag.name in ['h1', 'h2']:
