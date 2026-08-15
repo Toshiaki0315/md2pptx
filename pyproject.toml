@@ -16,6 +16,8 @@ source = [
     "text_metrics",
     "mermaid_renderer",
     "config_schema",
+    "extractor",
+    "pptx2md",
 ]
 
 [tool.mypy]
