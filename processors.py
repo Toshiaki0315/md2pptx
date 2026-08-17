@@ -111,8 +111,8 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     """見出しタグの処理とスライド作成"""
     finalize_slide(generator)
         
-    layout_idx = 0 if tag.name == 'h1' else 1
-    generator.current_slide = generator.prs.slides.add_slide(generator.prs.slide_layouts[layout_idx])
+    kind = 'title' if tag.name == 'h1' else 'content'
+    generator.current_slide = generator.prs.slides.add_slide(generator.slide_layouts[kind])
     
     from pptx.enum.text import MSO_AUTO_SIZE
     title_shape = generator.current_slide.shapes.title
@@ -195,7 +195,7 @@ def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
     """水平線（---）による新しいスライド（タイトルなし）の生成"""
     finalize_slide(generator)
 
-    generator.current_slide = generator.prs.slides.add_slide(generator.prs.slide_layouts[1])
+    generator.current_slide = generator.prs.slides.add_slide(generator.slide_layouts['content'])
     
     # タイトルシェイプを削除して上部から広く使えるようにする
     if generator.current_slide.shapes.title:

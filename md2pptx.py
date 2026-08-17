@@ -11,7 +11,7 @@ import yaml
 import traceback
 
 from config_schema import validate_config
-from generator import PPTXGenerator
+from generator import PPTXGenerator, TemplateError
 
 # theme.accent_color / theme.text_color を反映するフォント設定のキー
 ACCENT_FONT_KEYS = ['title_h1', 'title_h2', 'title_h3', 'table_header']
@@ -93,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Success: '{args.output}' の生成が完了しました！")
         return 0
 
+    except TemplateError as e:
+        print(f"Error: テンプレート '{args.config}' の設定を確認してください。\n  - {e}")
+        return 1
     except PermissionError:
         print(f"Error: '{args.output}' に書き込めません！PowerPointでファイルを開いたままにしていませんか？閉じてから再実行してください。")
         return 1

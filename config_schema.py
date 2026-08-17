@@ -23,7 +23,10 @@ from typing import Any
 #: 最上位で認識するキー
 KNOWN_TOP_LEVEL = ('slides', 'fonts', 'images', 'theme', 'mermaid')
 
-KNOWN_SLIDES = ('template_path', 'layout', 'show_slide_number', 'h3_as', 'footer')
+KNOWN_SLIDES = (
+    'template_path', 'layout', 'show_slide_number', 'h3_as', 'footer',
+    'layouts', 'use_template_fonts',
+)
 KNOWN_IMAGES = ('default_height_inches', 'position_inches', 'downscale', 'dpi')
 KNOWN_THEME = (
     'accent_color', 'text_color', 'code_bg_color',
@@ -45,6 +48,9 @@ BULLET_LEVEL_PATTERN = re.compile(r'^(bullet|ordered)_level_\d+$')
 
 #: フッターの項目
 KNOWN_FOOTER = ('text', 'date', 'show_on_title')
+
+#: スライドレイアウトの用途
+KNOWN_LAYOUT_KINDS = ('title', 'content')
 
 #: 選択肢が決まっている項目
 VALID_LAYOUTS = ('16:9', '4:3', '16:10', 'A4')
@@ -158,6 +164,9 @@ def _validate_slides(conf: Any, result: ValidationResult) -> None:
     if conf.get('show_slide_number') is not None:
         _check_bool('slides.show_slide_number', conf['show_slide_number'], result)
     _validate_footer(conf.get('footer'), result)
+    _validate_layouts(conf.get('layouts'), result)
+    if conf.get('use_template_fonts') is not None:
+        _check_bool('slides.use_template_fonts', conf['use_template_fonts'], result)
     if conf.get('h3_as') is not None:
         h3_as = conf['h3_as']
         if h3_as not in VALID_H3_AS:
@@ -166,6 +175,16 @@ def _validate_slides(conf: Any, result: ValidationResult) -> None:
                 f"（{' / '.join(VALID_H3_AS)} のいずれか）"
                 f"{_suggestion(str(h3_as), VALID_H3_AS)}"
             )
+
+
+def _validate_layouts(conf: Any, result: ValidationResult) -> None:
+    if not _check_mapping('slides.layouts', conf, result):
+        return
+    _check_unknown_keys('slides.layouts.', conf, KNOWN_LAYOUT_KINDS, result)
+
+    for kind in KNOWN_LAYOUT_KINDS:
+        if conf.get(kind) is not None:
+            _check_str(f'slides.layouts.{kind}', conf[kind], result)
 
 
 def _validate_footer(conf: Any, result: ValidationResult) -> None:

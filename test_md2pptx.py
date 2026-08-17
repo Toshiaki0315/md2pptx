@@ -35,7 +35,7 @@ import utils
 import text_metrics
 from config_schema import validate_config
 from extractor import extract, write_images
-from generator import PPTXGenerator
+from generator import PPTXGenerator, TemplateError
 from layout import SlideLayout
 from text_metrics import (
     ParagraphMetrics,
@@ -3255,3 +3255,202 @@ class TestExtractEdgeCases:
         """空行が続く箇所はまとめられる"""
         result = converted("## 見出し\n\n本文1\n\n本文2\n")
         assert "\n\n\n" not in result.markdown
+
+
+# =====================================================================
+# テンプレート（テーマ）の利用
+# =====================================================================
+
+
+@pytest.fixture
+def template_factory(tmp_path):
+    """検証用のテンプレートPPTXを作る"""
+    def make(name="template.pptx", reorder=None, width_in=13.333, height_in=7.5):
+        prs = Presentation()
+        prs.slide_width, prs.slide_height = Inches(width_in), Inches(height_in)
+        if reorder:
+            # レイアウトの並び順を入れ替える（社内テンプレートを想定）
+            id_list = prs.slide_master.slide_layouts._sldLayoutIdLst
+            ids = list(id_list)
+            id_list.remove(ids[reorder[0]])
+            id_list.insert(reorder[0], ids[reorder[1]])
+        path = tmp_path / name
+        prs.save(str(path))
+        return str(path)
+    return make
+
+
+class TestTemplate:
+    """テンプレートから引き継がれるもの"""
+
+    def _generate(self, base_config, tmp_path, template, **slides):
+        base_config["slides"].update({"template_path": template, **slides})
+        gen = PPTXGenerator(base_config)
+        gen.generate("# 表紙\n\n## 中身\n本文\n", str(tmp_path / "out.pptx"))
+        return gen
+
+    def test_slide_size_comes_from_the_template(self, base_config, tmp_path, template_factory):
+        """スライドサイズはテンプレートに従う（slides.layout より優先）"""
+        base_config["slides"]["layout"] = "16:9"
+        gen = self._generate(base_config, tmp_path, template_factory())
+
+        assert gen.prs.slide_width == Inches(13.333)
+
+    def test_content_area_follows_the_template(self, base_config, tmp_path, template_factory):
+        """画像・表の配置がテンプレートの本文枠に追従する"""
+        gen = self._generate(base_config, tmp_path, template_factory())
+        body = gen.prs.slide_layouts[1].placeholders[1]
+
+        assert gen.layout.content_left == body.left
+
+    def test_layouts_can_be_selected_by_name(self, base_config, tmp_path, template_factory):
+        """レイアウトを名前で指定できる
+
+        レイアウトの並び順はテンプレートによって異なるため、位置で決め打つと
+        意図しないレイアウトが使われる。
+        """
+        gen = self._generate(
+            base_config, tmp_path, template_factory(),
+            layouts={"title": "Title Slide", "content": "Two Content"},
+        )
+
+        assert {s.slide_layout.name for s in gen.prs.slides} == {"Title Slide", "Two Content"}
+
+    def test_unknown_layout_name_is_reported(self, base_config, tmp_path, template_factory):
+        """存在しないレイアウト名は、使用できる一覧を添えて知らせる"""
+        base_config["slides"].update({
+            "template_path": template_factory(), "layouts": {"content": "無いレイアウト"},
+        })
+
+        with pytest.raises(TemplateError, match="無いレイアウト"):
+            PPTXGenerator(base_config)
+
+    def test_missing_layout_index_is_reported(self, base_config, tmp_path, mocker):
+        """レイアウトが足りないテンプレートも分かるように知らせる"""
+        gen_cls = PPTXGenerator
+        mocker.patch.object(
+            gen_cls, "_resolve_layouts",
+            side_effect=lambda self=None: None,
+        )
+        # 直接確認する（レイアウトが1つも無いテンプレートは作れないため）
+        gen = PPTXGenerator(base_config)
+        mocker.stopall()
+        gen.prs.slide_layouts._sldLayoutIdLst.clear()
+
+        with pytest.raises(TemplateError, match="レイアウトが足りません"):
+            gen._layout_by_index(1)
+
+
+class TestBodyPlaceholderFallback:
+    """本文枠を持たないレイアウトが選ばれた場合"""
+
+    def test_falls_back_with_a_warning(self, base_config, tmp_path, template_factory, capsys):
+        """本文枠が無ければ、持っているレイアウトに切り替えて知らせる
+
+        以前は本文を書き込む段階で
+        「no placeholder on this slide with idx == 1」という
+        原因の分かりにくいエラーになっていた。
+        """
+        # レイアウト[1]を「Title Only」（本文枠なし）に差し替える
+        template = template_factory(reorder=(1, 5))
+        base_config["slides"]["template_path"] = template
+
+        gen = PPTXGenerator(base_config)
+        gen.generate("## 中身\n本文\n", str(tmp_path / "out.pptx"))
+
+        captured = capsys.readouterr().out
+        assert "本文枠が無いため" in captured
+        assert gen.slide_layouts["content"].name != "Title Only"
+
+    def test_error_when_no_layout_has_a_body(self, base_config, mocker):
+        """本文枠を持つレイアウトが1つも無ければエラーにする"""
+        mocker.patch("generator._has_body_placeholder", return_value=False)
+
+        with pytest.raises(TemplateError, match="本文を書き込めるレイアウトがありません"):
+            PPTXGenerator(base_config)
+
+
+class TestUseTemplateFonts:
+    """テンプレート（テーマ）のフォントに任せる"""
+
+    def _title_run(self, gen):
+        return gen.prs.slides[0].shapes.title.text_frame.paragraphs[0].runs[0]
+
+    def test_config_fonts_are_applied_by_default(self, base_config, tmp_path):
+        """既定では config.yaml のフォントが当たる"""
+        gen = PPTXGenerator(base_config)
+        gen.generate("# 表紙\n", str(tmp_path / "out.pptx"))
+
+        assert self._title_run(gen).font.name == "Meiryo"
+
+    def test_template_fonts_are_kept(self, base_config, tmp_path):
+        """use_template_fonts: true では書式を指定せず、テンプレートに任せる"""
+        base_config["slides"]["use_template_fonts"] = True
+        gen = PPTXGenerator(base_config)
+        gen.generate("# 表紙\n", str(tmp_path / "out.pptx"))
+
+        run = self._title_run(gen)
+        assert run.font.name is None
+        assert run.font.size is None
+
+    def test_code_fonts_are_preserved(self, base_config, tmp_path):
+        """等幅フォントの指定は可読性のために残す"""
+        base_config["slides"]["use_template_fonts"] = True
+        gen = PPTXGenerator(base_config)
+
+        assert "inline_code" in gen.fonts_conf
+        assert "body" not in gen.fonts_conf
+
+
+class TestTemplateConfigValidation:
+    """テンプレート関連の設定の検証"""
+
+    def _result(self, config):
+        return validate_config(config)
+
+    def test_layouts_must_be_strings(self):
+        (error,) = self._result({"slides": {"layouts": {"title": 1}}}).errors
+        assert "slides.layouts.title" in error
+
+    def test_layouts_must_be_a_mapping(self):
+        (error,) = self._result({"slides": {"layouts": "Title Slide"}}).errors
+        assert "入れ子" in error
+
+    def test_unknown_layout_kind_warns(self):
+        (warning,) = self._result({"slides": {"layouts": {"titel": "a"}}}).warnings
+        assert "'title' の誤りではありませんか？" in warning
+
+    def test_use_template_fonts_must_be_boolean(self):
+        (error,) = self._result({"slides": {"use_template_fonts": "yes"}}).errors
+        assert "true か false" in error
+
+    def test_valid_settings_pass(self):
+        result = self._result({
+            "slides": {
+                "layouts": {"title": "Title Slide", "content": "Title and Content"},
+                "use_template_fonts": True,
+            }
+        })
+        assert result.errors == [] and result.warnings == []
+
+
+class TestTemplateErrorInCli:
+    """テンプレートの問題をCLIで分かりやすく伝える"""
+
+    def test_main_reports_template_error(self, tmp_path, capsys, template_factory):
+        md = tmp_path / "in.md"
+        md.write_text("## 見出し\n", encoding="utf-8")
+        conf = tmp_path / "c.yaml"
+        conf.write_text(
+            "slides:\n"
+            f"  template_path: '{template_factory()}'\n"
+            "  layouts:\n"
+            "    content: '無いレイアウト'\n",
+            encoding="utf-8",
+        )
+
+        assert main([str(md), "-o", str(tmp_path / "o.pptx"), "-c", str(conf)]) == 1
+
+        captured = capsys.readouterr().out
+        assert "無いレイアウト" in captured
+        assert "使用できるレイアウト" in captured
