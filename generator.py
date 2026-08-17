@@ -30,6 +30,27 @@ from processors import (
 # スライドへ変換する対象のHTMLタグ
 TARGET_TAGS = ['h1', 'h2', 'h3', 'hr', 'p', 'li', 'img', 'pre', 'table', 'blockquote']
 
+# スライドレイアウトの用途と、名前が指定されない場合に使う既定の位置
+DEFAULT_LAYOUT_INDEXES = {'title': 0, 'content': 1}
+
+# 本文プレースホルダーの idx（PowerPointの慣習）
+BODY_PLACEHOLDER_IDX = 1
+
+# use_template_fonts の指定時も残すフォント設定
+# 等幅フォントや表見出しの文字色は、体裁ではなく可読性のために必要なもの
+FUNCTIONAL_FONT_KEYS = ('inline_code', 'code_block')
+
+
+class TemplateError(Exception):
+    """テンプレートが本ツールの想定を満たしていないことを表す"""
+
+
+def _has_body_placeholder(layout) -> bool:
+    """本文プレースホルダー（idx=1）を持つレイアウトかどうか"""
+    return any(
+        ph.placeholder_format.idx == BODY_PLACEHOLDER_IDX for ph in layout.placeholders
+    )
+
 
 class PPTXGenerator:
     """MarkdownをPowerPointに変換するジェネレータークラス"""
@@ -42,6 +63,8 @@ class PPTXGenerator:
 
         # スライドサイズから導出した配置寸法（_init_presentation で設定）
         self.layout: SlideLayout = None  # type: ignore[assignment]
+        # 見出しの種類ごとに使うスライドレイアウト（_init_presentation で設定）
+        self.slide_layouts: dict[str, Any] = {}
 
         # python-pptx のオブジェクト群（型が動的なため Any で保持する）
         self.prs: Any = None
@@ -67,8 +90,82 @@ class PPTXGenerator:
             self.prs.slide_width = width
             self.prs.slide_height = height
 
+        if self.slides_conf.get('use_template_fonts'):
+            # テンプレート（テーマ）のフォントに任せる。
+            # ただし等幅フォントなど、可読性のために必要な指定は残す
+            self.fonts_conf = {
+                key: value for key, value in self.fonts_conf.items()
+                if key in FUNCTIONAL_FONT_KEYS
+            }
+
+        self._resolve_layouts()
+
         # 画像・表・コード枠の配置は、この寸法を基準に決める
         self.layout = SlideLayout.from_presentation(self.prs)
+
+    def _resolve_layouts(self) -> None:
+        """見出しの種類ごとに使うスライドレイアウトを決める
+
+        config.yaml で名前が指定されていればそれを使い、無ければ位置で選ぶ。
+        レイアウトの並び順はテンプレートによって異なるため、社内テンプレートでは
+        名前で指定できる方が確実である。
+        """
+        names = self.slides_conf.get('layouts') or {}
+
+        for kind, index in DEFAULT_LAYOUT_INDEXES.items():
+            name = names.get(kind)
+            self.slide_layouts[kind] = (
+                self._layout_by_name(kind, name) if name
+                else self._layout_by_index(index)
+            )
+
+        self._ensure_body_placeholder()
+
+    def _layout_by_name(self, kind: str, name: str):
+        for layout in self.prs.slide_layouts:
+            if layout.name == name:
+                return layout
+        raise TemplateError(
+            f"slides.layouts.{kind}: テンプレートに '{name}' というレイアウトがありません。\n"
+            f"       使用できるレイアウト: {self._layout_names()}"
+        )
+
+    def _layout_by_index(self, index: int):
+        if index < len(self.prs.slide_layouts):
+            return self.prs.slide_layouts[index]
+        raise TemplateError(
+            f"テンプレートのレイアウトが足りません（{len(self.prs.slide_layouts)}個）。\n"
+            f"       slides.layouts で使用するレイアウト名を指定してください。"
+        )
+
+    def _ensure_body_placeholder(self) -> None:
+        """本文用レイアウトに本文プレースホルダーがあることを確かめる
+
+        無いレイアウト（「タイトルのみ」など）が選ばれていると、本文を書き込む
+        段階で原因の分かりにくいエラーになるため、ここで気付けるようにする。
+        """
+        if _has_body_placeholder(self.slide_layouts['content']):
+            return
+
+        fallback = next(
+            (l for l in self.prs.slide_layouts if _has_body_placeholder(l)), None
+        )
+        if fallback is None:
+            raise TemplateError(
+                "テンプレートに本文を書き込めるレイアウトがありません"
+                "（本文プレースホルダーを持つレイアウトが必要です）。\n"
+                f"       使用できるレイアウト: {self._layout_names()}"
+            )
+
+        print(
+            f"Warning: レイアウト '{self.slide_layouts['content'].name}' には本文枠が無いため、"
+            f"'{fallback.name}' を使用します。\n"
+            f"         slides.layouts.content で明示的に指定できます。"
+        )
+        self.slide_layouts['content'] = fallback
+
+    def _layout_names(self) -> str:
+        return ' / '.join(layout.name for layout in self.prs.slide_layouts)
 
     def _get_slide_size(self, layout_str: str) -> tuple[int, int]:
         sizes = {
@@ -97,7 +194,7 @@ class PPTXGenerator:
         if front_matter and front_matter.get('title'):
             from pptx.enum.text import MSO_AUTO_SIZE
             
-            self.current_slide = self.prs.slides.add_slide(self.prs.slide_layouts[0])
+            self.current_slide = self.prs.slides.add_slide(self.slide_layouts['title'])
             
             title_shape = self.current_slide.shapes.title
             if title_shape:
