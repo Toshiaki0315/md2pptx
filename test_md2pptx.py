@@ -33,6 +33,7 @@ from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Pt
 
 import extractor
+import font_metrics
 import gui_deps
 import gui_runner
 import make_template
@@ -47,7 +48,9 @@ from extractor import extract, write_images
 from generator import PPTXGenerator, TemplateError
 from layout import SlideLayout
 from text_metrics import (
+    LINE_HEIGHT_RATIO,
     ParagraphMetrics,
+    line_height_ratio,
     TableRowMetrics,
     estimate_row_heights_pt,
     estimate_table_height_pt,
@@ -4459,3 +4462,192 @@ class TestBulletsFromOtherTools:
         assert "* 箇条書き" in markdown
         assert "* 平文" not in markdown
         assert "\n平文\n" in markdown
+
+
+# =============================================================================
+# font_metrics.py（フォントの実測値）
+# =============================================================================
+
+
+def build_test_font(directory, family="Metrics Test"):
+    """既知のメトリクスを持つフォントを作る
+
+    実在するフォントは環境によって有無が変わるため、テストでは合成する。
+    行送り比 = (800 + 200 + 200) / 1000 = 1.2、'A' の送り幅 = 0.6em、
+    'あ' = 1.0em、それ以外の文字は持たない。
+    """
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+    glyphs = [".notdef", "A", "uni3042"]
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder(glyphs)
+    builder.setupCharacterMap({0x41: "A", 0x3042: "uni3042"})
+    builder.setupGlyf({name: TTGlyphPen(None).glyph() for name in glyphs})
+    builder.setupHorizontalMetrics(
+        {".notdef": (500, 0), "A": (600, 0), "uni3042": (1000, 0)}
+    )
+    builder.setupHorizontalHeader(ascent=800, descent=-200, lineGap=200)
+    builder.setupNameTable({
+        "familyName": family, "styleName": "Regular",
+        "fullName": f"{family} Regular", "psName": f"{family}-Regular",
+        "version": "1.0", "uniqueFontIdentifier": family,
+    })
+    builder.setupOS2()
+    builder.setupPost()
+    path = os.path.join(str(directory), "TestFont.ttf")
+    builder.save(path)
+    return path
+
+
+@pytest.fixture
+def installed_font(tmp_path, monkeypatch):
+    """合成したフォントだけが入っている環境を用意する"""
+    build_test_font(tmp_path)
+    monkeypatch.setattr(font_metrics, "font_directories", lambda: [str(tmp_path)])
+    font_metrics._font_index.cache_clear()
+    font_metrics.metrics_for.cache_clear()
+    yield "Metrics Test"
+    font_metrics._font_index.cache_clear()
+    font_metrics.metrics_for.cache_clear()
+
+
+class TestFontLookup:
+    """フォントファイルの探索"""
+
+    def test_name_is_matched_loosely(self):
+        """空白や大小の違いは無視して照合する"""
+        assert font_metrics.normalize("Yu Gothic") == font_metrics.normalize("yugothic")
+
+    def test_finds_a_font_by_its_family_name(self, installed_font):
+        assert font_metrics.metrics_for(installed_font) is not None
+
+    def test_unknown_font_is_not_found(self, installed_font):
+        """手元に無いフォントは None（既定値に任せる）"""
+        assert font_metrics.metrics_for("存在しないフォント") is None
+
+    def test_no_name_is_not_looked_up(self):
+        assert font_metrics.metrics_for(None) is None
+
+    def test_missing_directories_are_skipped(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            font_metrics, "font_directories", lambda: [str(tmp_path / "無い")]
+        )
+        assert font_metrics.font_files() == []
+
+    def test_broken_font_files_are_skipped(self, tmp_path, monkeypatch):
+        """壊れたファイルがあっても探索は続く"""
+        (tmp_path / "broken.ttf").write_text("フォントではありません", encoding="utf-8")
+        build_test_font(tmp_path)
+        monkeypatch.setattr(font_metrics, "font_directories", lambda: [str(tmp_path)])
+        font_metrics._font_index.cache_clear()
+        font_metrics.metrics_for.cache_clear()
+
+        assert font_metrics.metrics_for("Metrics Test") is not None
+
+    def test_unreadable_font_falls_back(self, installed_font, mocker):
+        """索引には載ったが開けない場合も既定値に落とす"""
+        assert font_metrics.metrics_for(installed_font) is not None  # 先に索引を作る
+
+        mocker.patch("font_metrics._open_fonts", side_effect=OSError())
+        font_metrics.metrics_for.cache_clear()  # 索引は残したまま読み込みだけやり直す
+
+        assert font_metrics.metrics_for(installed_font) is None
+
+    def test_unreadable_name_table_is_skipped(self):
+        """名前のテーブルを読めないフォントは、名前なしとして扱う"""
+        class Broken:
+            def __getitem__(self, key):
+                raise KeyError(key)
+
+        assert font_metrics._names_of(Broken()) == []
+
+    def test_works_without_fonttools(self, mocker):
+        """fontTools が無い環境でも変換自体は動く"""
+        mocker.patch("font_metrics.TTFont", None)
+        font_metrics.metrics_for.cache_clear()
+        font_metrics._font_index.cache_clear()
+        try:
+            assert font_metrics.metrics_for("Metrics Test") is None
+            assert font_metrics._font_index() == {}
+        finally:
+            font_metrics.metrics_for.cache_clear()
+            font_metrics._font_index.cache_clear()
+
+    def test_font_directories_differ_by_platform(self, monkeypatch):
+        monkeypatch.setattr(font_metrics.sys, "platform", "darwin")
+        assert any("Library/Fonts" in d for d in font_metrics.font_directories())
+
+        monkeypatch.setattr(font_metrics.sys, "platform", "win32")
+        monkeypatch.setattr(font_metrics.os, "name", "nt")
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\me\AppData\Local")
+        directories = font_metrics.font_directories()
+        assert any(d.endswith("Fonts") for d in directories)
+        assert any("AppData" in d for d in directories)  # 利用者ごとのフォントも見る
+
+        monkeypatch.setattr(font_metrics.sys, "platform", "linux")
+        monkeypatch.setattr(font_metrics.os, "name", "posix")
+        assert "/usr/share/fonts" in font_metrics.font_directories()
+
+
+class TestMeasuredMetrics:
+    """実測値を使った概算"""
+
+    def test_line_height_comes_from_the_font(self, installed_font):
+        """行の高さはフォントの ascent + descent + lineGap から決まる"""
+        assert line_height_ratio(installed_font) == pytest.approx(1.2)
+
+    def test_default_is_used_without_a_font(self):
+        assert line_height_ratio("存在しないフォント") == LINE_HEIGHT_RATIO
+
+    def test_character_width_comes_from_the_font(self, installed_font):
+        """'A' は 0.5em ではなく実測の 0.6em として扱う"""
+        width = estimate_text_width_pt("A", 100, installed_font)
+
+        assert width == pytest.approx(60.0)
+
+    def test_characters_absent_from_the_font_fall_back(self, installed_font):
+        """フォントに無い文字は全角/半角から概算する"""
+        assert estimate_text_width_pt("Z", 100, installed_font) == pytest.approx(50.0)
+        assert estimate_text_width_pt("あ", 100, installed_font) == pytest.approx(100.0)
+
+    def test_line_count_uses_measured_widths(self, installed_font):
+        """折り返し行数の判定にも実測値が効く"""
+        # 'A' 10文字 = 600pt。550pt の幅なら2行になる（既定値の 0.5em なら1行）
+        assert estimate_line_count("A" * 10, 100, 550, installed_font) == 2
+        assert estimate_line_count("A" * 10, 100, 550) == 1
+
+    def test_paragraph_height_uses_the_font(self, installed_font):
+        """段落の高さも実測の行送りで計算される"""
+        paragraph = ParagraphMetrics(text="A", font_size_pt=100, font_name=installed_font)
+
+        assert estimate_height_pt([paragraph], 1000) == pytest.approx(120.0)
+
+    def test_table_row_height_uses_the_font(self, installed_font):
+        """表の行の高さも同様"""
+        row = TableRowMetrics(texts=["A"], font_size_pt=100, font_name=installed_font)
+
+        (height,) = estimate_row_heights_pt([row], 1000, 0.0)
+        assert height == pytest.approx(120.0)
+
+
+class TestFontNameIsCarriedOver:
+    """書体の指定が概算まで届いているか"""
+
+    def test_paragraph_font_is_picked_up(self, gen_with_slide):
+        """段落から書体名を取り出す"""
+        gen_with_slide.generate("## 見出し\n\n本文です\n", "/dev/null")
+        paragraph = [
+            p for p in gen_with_slide.current_body.paragraphs if p.text == "本文です"
+        ][0]
+
+        assert utils._paragraph_metrics(paragraph).font_name == paragraph.runs[0].font.name
+
+    def test_table_font_is_picked_up(self):
+        """表の設定から書体名を取り出す"""
+        rows = parse_md("| A |\n|---|\n| 1 |").find_all("tr")
+        metrics = processors.table_row_metrics(
+            rows, {"name": "見出し書体", "size_pt": 14}, {"name": "本文書体", "size_pt": 12}
+        )
+
+        assert [row.font_name for row in metrics] == ["見出し書体", "本文書体"]

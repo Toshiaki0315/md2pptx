@@ -1,11 +1,14 @@
 """テキストを描画したときの分量を概算する
 
 python-pptx はレンダリングエンジンを持たないため、実際の折り返し位置や
-描画後の高さを知ることができない。ここでは文字幅（全角/半角）とフォントサイズから
+描画後の高さを知ることができない。ここではフォントサイズと文字幅から
 行数と高さを概算し、枠からのはみ出し判定に用いる。
 
-あくまで概算であり、実際のフォントのメトリクスとは一致しない。
-はみ出しを「完全に防ぐ」ことではなく「起こりにくくする」ことが目的である。
+文字幅と行の高さは、指定されたフォントが手元にあれば font_metrics が読む
+実測値を使い、無ければ全角/半角からの概算に落とす。
+
+いずれにせよ概算であり、はみ出しを「完全に防ぐ」ことではなく
+「起こりにくくする」ことが目的である。
 """
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ import math
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
+
+from font_metrics import FontMetrics, metrics_for
 
 #: 全角として扱う East Asian Width の区分（W=Wide, F=Fullwidth, A=Ambiguous）
 FULLWIDTH_CATEGORIES = ('W', 'F', 'A')
@@ -31,12 +36,14 @@ DEFAULT_FONT_SIZE_PT = 18.0
 #: 行送りの既定倍率
 DEFAULT_LINE_SPACING = 1.0
 
-#: 1行が占める高さの、フォントサイズに対する比率
+#: 1行が占める高さの、フォントサイズに対する比率（実測値が使えない場合の既定）
 #
 # PowerPoint の行の高さはフォントサイズそのものではなく、フォントが持つ
 # 行高（ascent + descent + line gap）に基づく。本ツールが主に使う和文フォント
 # （Meiryo / Yu Gothic 等）はこれが約 1.3em あるため、フォントサイズと同一と
 # みなすと 3 割ほど過小評価になる。
+# フォントファイルが手元にある場合は font_metrics が実測値を返すため、
+# この値は使われない。
 LINE_HEIGHT_RATIO = 1.3
 
 #: 縮小率の下限（これ以上小さくすると読めなくなるため）
@@ -58,25 +65,46 @@ class ParagraphMetrics:
     line_spacing: float = DEFAULT_LINE_SPACING
     space_after_pt: float = 0.0
     space_before_pt: float = 0.0
+    font_name: str | None = None
 
 
-def char_width_ratio(ch: str) -> float:
-    """1文字の幅を、フォントサイズに対する比率で返す"""
+def char_width_ratio(ch: str, metrics: FontMetrics | None = None) -> float:
+    """1文字の幅を、フォントサイズに対する比率で返す
+
+    フォントの実測値が使える場合はそれを優先する。フォントにその文字が
+    無い場合（欧文フォントに和文を書いた場合など）は全角/半角から概算する。
+    """
+    if metrics is not None:
+        measured = metrics.advance(ch)
+        if measured is not None:
+            return measured
     if unicodedata.east_asian_width(ch) in FULLWIDTH_CATEGORIES:
         return FULLWIDTH_RATIO
     return HALFWIDTH_RATIO
 
 
-def estimate_text_width_pt(text: str, font_size_pt: float) -> float:
+def line_height_ratio(font_name: str | None = None) -> float:
+    """1行が占める高さの、フォントサイズに対する比率"""
+    metrics = metrics_for(font_name)
+    return metrics.line_height_ratio if metrics is not None else LINE_HEIGHT_RATIO
+
+
+def estimate_text_width_pt(
+    text: str, font_size_pt: float, font_name: str | None = None
+) -> float:
     """テキストを1行で描画したときの幅（ポイント）を概算する"""
-    return sum(char_width_ratio(ch) for ch in text) * font_size_pt
+    metrics = metrics_for(font_name)
+    return sum(char_width_ratio(ch, metrics) for ch in text) * font_size_pt
 
 
-def estimate_line_count(text: str, font_size_pt: float, available_width_pt: float) -> int:
+def estimate_line_count(
+    text: str, font_size_pt: float, available_width_pt: float,
+    font_name: str | None = None,
+) -> int:
     """折り返しを考慮した行数を概算する（空行も1行として数える）"""
     if available_width_pt <= 0 or not text:
         return 1
-    width = estimate_text_width_pt(text, font_size_pt)
+    width = estimate_text_width_pt(text, font_size_pt, font_name)
     return max(1, math.ceil(width / available_width_pt))
 
 
@@ -91,8 +119,9 @@ def estimate_height_pt(
         # インデントで幅が無くなっても、最低1文字は入る前提で計算する
         width = max(available_width_pt - indent, font_size)
 
-        lines = estimate_line_count(paragraph.text, font_size, width)
-        total += lines * font_size * LINE_HEIGHT_RATIO * paragraph.line_spacing
+        lines = estimate_line_count(paragraph.text, font_size, width, paragraph.font_name)
+        total += (lines * font_size * line_height_ratio(paragraph.font_name)
+                  * paragraph.line_spacing)
         total += (paragraph.space_before_pt + paragraph.space_after_pt) * scale
     return total
 
@@ -143,6 +172,7 @@ class TableRowMetrics:
 
     texts: list[str]
     font_size_pt: float
+    font_name: str | None = None
 
 
 def estimate_row_heights_pt(
@@ -159,10 +189,13 @@ def estimate_row_heights_pt(
     for row in rows:
         font_size = row.font_size_pt * scale
         lines = max(
-            (estimate_line_count(text, font_size, column_width_pt) for text in row.texts),
+            (estimate_line_count(text, font_size, column_width_pt, row.font_name)
+             for text in row.texts),
             default=1,
         )
-        heights.append(lines * font_size * LINE_HEIGHT_RATIO + vertical_margin_pt)
+        heights.append(
+            lines * font_size * line_height_ratio(row.font_name) + vertical_margin_pt
+        )
     return heights
 
 
