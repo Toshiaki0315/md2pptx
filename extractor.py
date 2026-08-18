@@ -88,6 +88,15 @@ def has_bullet_tag(paragraph, tag: str) -> bool:
     return f'<a:{tag}' in paragraph._element.xml
 
 
+def uses_explicit_bullets(text_frame) -> bool:
+    """段落ごとに行頭記号が書き込まれた本文かどうか
+
+    1つでも明示された箇条書きがあれば、md2pptx が生成した本文とみなし、
+    指定の無い段落は平文の段落として扱ってよい。
+    """
+    return any(has_bullet_tag(p, 'buChar') for p in text_frame.paragraphs)
+
+
 def run_to_markdown(run, plain: bool = False) -> str:
     """1つの run を装飾付きのMarkdownに戻す
 
@@ -117,11 +126,16 @@ def paragraph_to_markdown(paragraph, plain: bool = False) -> str:
 def body_to_markdown(text_frame, as_list: bool = True) -> list[str]:
     """本文プレースホルダーを Markdown の行に戻す
 
-    本文プレースホルダーは既定ですべての段落に行頭記号が付くため、
-    平文の段落と第1階層の箇条書きはXML上で区別できない。
-    スライド上は箇条書きとして見えているので、リスト項目として書き出す。
+    md2pptx が生成した本文では、箇条書きの段落にだけ行頭記号が書き込んで
+    あるため、指定の無い段落は平文の段落だと分かる。
+
+    他のツールで作られた資料には段落ごとの指定が無く、本文プレースホルダーの
+    既定でどの段落にも行頭記号が付く。この場合は平文と箇条書きを区別できない
+    ため、スライド上の見た目に合わせて従来どおりすべてを箇条書きとして書き出す。
     （タイトルスライドのサブタイトルなど、リストでない枠は as_list=False）
     """
+    explicit = uses_explicit_bullets(text_frame)
+
     lines: list[str] = []
     for paragraph in text_frame.paragraphs:
         text = paragraph_to_markdown(paragraph)
@@ -134,7 +148,7 @@ def body_to_markdown(text_frame, as_list: bool = True) -> list[str]:
             lines.append(f'### {paragraph_to_markdown(paragraph, plain=True)}')
         elif has_bullet_tag(paragraph, 'buAutoNum'):
             lines.append(f'{INDENT * paragraph.level}1. {text}')
-        elif as_list:
+        elif has_bullet_tag(paragraph, 'buChar') or (as_list and not explicit):
             lines.append(f'{INDENT * paragraph.level}* {text}')
         else:
             lines.append(text)
