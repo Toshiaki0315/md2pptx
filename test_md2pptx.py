@@ -28,6 +28,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.enum.text import PP_ALIGN
+from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Pt
 
@@ -81,6 +82,7 @@ from processors import (
 from utils import (
     DEFAULT_IMAGE_DPI,
     find_body_placeholder,
+    inherited_bullet,
     apply_auto_numbering,
     disable_bullet,
     set_alt_text,
@@ -3027,6 +3029,22 @@ class TestExtractText:
         result = converted("## 手順\n\n1. 最初\n2. 次\n")
         assert result.markdown.count("1. ") == 2  # Markdownでは連番でなくてよい
 
+    def test_plain_paragraph_stays_plain(self, converted):
+        """平文の段落は箇条書きにならない
+
+        以前は本文枠のすべての段落が箇条書きとして書き出されていた。
+        """
+        result = converted("## 見出し\n\n平文の段落です。\n\n* 箇条書き\n")
+
+        assert "\n平文の段落です。\n" in result.markdown
+        assert "* 平文の段落です。" not in result.markdown
+
+    def test_bullet_stays_a_bullet(self, converted):
+        """同じ本文の中で、箇条書きは箇条書きのまま戻る"""
+        result = converted("## 見出し\n\n平文の段落です。\n\n* 箇条書き\n")
+
+        assert "* 箇条書き" in result.markdown
+
     def test_inline_decorations(self, converted):
         """太字・インラインコードが復元される"""
         result = converted("## 見出し\n\n**太字** と `コード` です\n")
@@ -4272,3 +4290,172 @@ class TestGuiRunConversion:
         returncode, _ = gui_runner.run_conversion(self._settings(tmp_path), lambda _l: None)
 
         assert returncode == 0
+
+
+class TestBulletMarking:
+    """箇条書きの行頭記号を段落へ明示的に書き込む
+
+    本文プレースホルダーでは行頭記号がレイアウトから継承され、平文の段落にも
+    同じ記号が付く。XML上は区別できないため、逆変換で平文と箇条書きが
+    見分けられなかった。継承値と同じ記号を書き戻すことで、見た目を変えずに
+    「箇条書きである」と残す。
+    """
+
+    def _bullets(self, gen):
+        """本文の各段落の (階層, テキスト, 行頭記号の文字) を並べる"""
+        result = []
+        for p in gen.current_body.paragraphs:
+            if not p.text.strip():
+                continue
+            p_pr = p._element.find(qn("a:pPr"))
+            char = None
+            if p_pr is not None:
+                element = p_pr.find(qn("a:buChar"))
+                char = element.get("char") if element is not None else None
+            result.append((p.level, p.text, char))
+        return result
+
+    def _master_char(self, gen, level):
+        """マスターが定める、その階層の行頭記号"""
+        body_style = gen.prs.slide_master._element.find(qn("p:txStyles")).find(
+            qn("p:bodyStyle")
+        )
+        return body_style.find(qn(f"a:lvl{level + 1}pPr")).find(qn("a:buChar")).get("char")
+
+    def test_list_items_are_marked(self, gen_with_slide):
+        """箇条書きにだけ行頭記号が書き込まれる"""
+        gen_with_slide.generate("## 見出し\n\n平文です\n\n* 項目\n", "/dev/null")
+        gen = gen_with_slide
+
+        marks = {text: char for _level, text, char in self._bullets(gen)}
+        assert marks["平文です"] is None
+        assert marks["項目"] == self._master_char(gen, 0)
+
+    def test_marked_character_matches_the_template(self, gen_with_slide):
+        """書き込む記号は継承値と同じにする（見た目を変えないため）"""
+        gen_with_slide.generate("## 見出し\n\n* 親\n    * 子\n", "/dev/null")
+        gen = gen_with_slide
+
+        chars = {level: char for level, _text, char in self._bullets(gen)}
+        assert chars[0] == self._master_char(gen, 0)
+        assert chars[1] == self._master_char(gen, 1)
+        assert chars[0] != chars[1]  # 階層ごとに記号が違うことの確認
+
+    def test_bullet_font_is_carried_over(self, gen_with_slide):
+        """記号の書体も継承値をそのまま使う"""
+        gen_with_slide.generate("## 見出し\n\n* 項目\n", "/dev/null")
+
+        p = [p for p in gen_with_slide.current_body.paragraphs if p.text == "項目"][0]
+        font = p._element.find(qn("a:pPr")).find(qn("a:buFont"))
+        assert font is not None and font.get("typeface") == "Arial"
+
+    def test_ordered_items_keep_auto_numbering(self, gen_with_slide):
+        """番号付きリストは従来どおり自動採番のまま"""
+        gen_with_slide.generate("## 見出し\n\n1. 手順\n", "/dev/null")
+
+        p = [p for p in gen_with_slide.current_body.paragraphs if p.text == "手順"][0]
+        assert p._element.find(qn("a:pPr")).find(qn("a:buAutoNum")) is not None
+        assert p._element.find(qn("a:pPr")).find(qn("a:buChar")) is None
+
+    def test_nothing_is_written_when_the_template_hides_bullets(self, gen_with_slide, mocker):
+        """行頭記号を出さないテンプレートでは、記号を足さない"""
+        mocker.patch("utils.inherited_bullet", return_value=None)
+
+        gen_with_slide.generate("## 見出し\n\n* 項目\n", "/dev/null")
+
+        assert all(char is None for _l, _t, char in self._bullets(gen_with_slide))
+
+
+class TestInheritedBullet:
+    """継承される行頭記号の解決（utils.inherited_bullet）"""
+
+    def _body_style(self, gen):
+        return gen.prs.slide_master._element.find(qn("p:txStyles")).find(qn("p:bodyStyle"))
+
+    def _level(self, gen, level=0):
+        return self._body_style(gen).find(qn(f"a:lvl{level + 1}pPr"))
+
+    def test_finds_the_character_for_the_level(self, gen_with_slide):
+        char, font = inherited_bullet(gen_with_slide.current_slide, 0)
+
+        assert char.get("char") == "•"
+        assert font.get("typeface") == "Arial"
+
+    def test_returns_none_when_bullets_are_disabled(self, gen_with_slide):
+        """buNone のテンプレートでは記号が無いので None"""
+        level = self._level(gen_with_slide)
+        level.remove(level.find(qn("a:buChar")))
+        level.append(OxmlElement("a:buNone"))
+
+        assert inherited_bullet(gen_with_slide.current_slide, 0) is None
+
+    def test_returns_none_for_picture_bullets(self, gen_with_slide):
+        """画像の行頭記号は文字で表せないので None"""
+        level = self._level(gen_with_slide)
+        level.remove(level.find(qn("a:buChar")))
+        level.append(OxmlElement("a:buBlip"))
+
+        assert inherited_bullet(gen_with_slide.current_slide, 0) is None
+
+    def test_returns_none_when_nothing_is_defined(self, gen_with_slide):
+        """どこにも定義が無ければ None（勝手に記号を作らない）"""
+        body_style = self._body_style(gen_with_slide)
+        body_style.getparent().remove(body_style)
+
+        assert inherited_bullet(gen_with_slide.current_slide, 0) is None
+
+    def test_layout_takes_precedence_over_the_master(self, gen_with_slide):
+        """レイアウト側の指定があれば、そちらを優先する"""
+        layout = gen_with_slide.current_slide.slide_layout
+        list_style = find_body_placeholder(layout).text_frame._txBody.find(qn("a:lstStyle"))
+        level = OxmlElement("a:lvl1pPr")
+        char = OxmlElement("a:buChar")
+        char.set("char", "▶")
+        level.append(char)
+        list_style.append(level)
+
+        found, _font = inherited_bullet(gen_with_slide.current_slide, 0)
+
+        assert found.get("char") == "▶"
+
+
+class TestBulletsFromOtherTools:
+    """md2pptx 以外で作られた資料の扱い（後方互換）"""
+
+    def _deck(self, text_frame_filler):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        slide.shapes.title.text = "見出し"
+        text_frame_filler(find_body_placeholder(slide).text_frame)
+        return prs
+
+    def test_unmarked_paragraphs_stay_bullets(self):
+        """行頭記号の指定が無い資料は、従来どおり箇条書きとして書き出す
+
+        本文枠の既定でどの段落にも記号が付いて見えるため、
+        平文として書き出すと見た目と食い違う。
+        """
+        def fill(tf):
+            tf.text = "一つ目"
+            tf.add_paragraph().text = "二つ目"
+
+        markdown = extract(self._deck(fill)).markdown
+
+        assert "* 一つ目" in markdown
+        assert "* 二つ目" in markdown
+
+    def test_explicit_marking_switches_the_interpretation(self):
+        """1つでも明示があれば、指定の無い段落は平文として扱う"""
+        def fill(tf):
+            tf.text = "平文"
+            marked = tf.add_paragraph()
+            marked.text = "箇条書き"
+            char = OxmlElement("a:buChar")
+            char.set("char", "•")
+            utils._set_bullet(marked, char)
+
+        markdown = extract(self._deck(fill)).markdown
+
+        assert "* 箇条書き" in markdown
+        assert "* 平文" not in markdown
+        assert "\n平文\n" in markdown

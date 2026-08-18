@@ -32,6 +32,7 @@ from utils import (
     downscale_image,
     fit_shape_into,
     insert_image_fit,
+    mark_as_bullet,
     set_alt_text,
     shrink_body_shape,
     add_runs_from_tag,
@@ -796,4 +797,7 @@ def process_text(generator: PPTXGenerator, tag: Tag) -> None:
     if ordered:
         # PowerPoint側で採番させる（項目を入れ替えても番号が崩れない）
         apply_auto_numbering(paragraph)
+    elif tag.name == 'li':
+        # 継承値と同じ行頭記号を書き戻し、平文の段落と区別できるようにする
+        mark_as_bullet(paragraph, generator.current_slide, level)
     generator.slide_has_text = True

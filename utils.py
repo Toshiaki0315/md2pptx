@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import collections
 import collections.abc
+import copy
 import os
 from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any, Union
@@ -92,7 +93,7 @@ def find_body_placeholder(container: Any) -> Any:
 
 
 #: 段落の行頭記号を指定する要素（差し替え時に取り除く）
-BULLET_TAGS = ('a:buNone', 'a:buAutoNum', 'a:buChar')
+BULLET_TAGS = ('a:buFont', 'a:buNone', 'a:buAutoNum', 'a:buChar')
 
 #: pPr 内で行頭記号より後ろに来る要素（この直前に挿入する）
 BULLET_SUCCESSOR_TAGS = ('a:tabLst', 'a:defRPr', 'a:extLst')
@@ -135,11 +136,12 @@ def apply_syntax_highlight(
         if token_style['bold']: run.font.bold = True
         if token_style['italic']: run.font.italic = True
 
-def _set_bullet(paragraph: _Paragraph, bullet: Any) -> None:
+def _set_bullet(paragraph: _Paragraph, *bullets: Any) -> None:
     """段落の行頭記号の指定を差し替える
 
     DrawingMLでは pPr の子要素の順序が決まっており、行頭記号の指定は
     tabLst / defRPr / extLst より前に置く必要がある。
+    複数渡した場合は渡した順に並べる（buFont は buChar より前）。
     """
     p_pr = paragraph._element.get_or_add_pPr()
 
@@ -150,14 +152,79 @@ def _set_bullet(paragraph: _Paragraph, bullet: Any) -> None:
     for tag in BULLET_SUCCESSOR_TAGS:
         successor = p_pr.find(qn(tag))
         if successor is not None:
-            successor.addprevious(bullet)
+            for bullet in bullets:
+                successor.addprevious(bullet)
             return
-    p_pr.append(bullet)
+    for bullet in bullets:
+        p_pr.append(bullet)
 
 
 def disable_bullet(paragraph: _Paragraph) -> None:
     """段落の行頭記号を消す（見出しなど、箇条書きに見せたくない段落用）"""
     _set_bullet(paragraph, OxmlElement('a:buNone'))
+
+
+def inherited_bullet(slide: Slide, level: int) -> tuple[Any, Any] | None:
+    """その階層の段落に実際に描かれる行頭記号を、レイアウトとマスターから探す
+
+    (buChar要素, buFont要素) を返す。buFont は無い場合がある。
+    行頭記号が無い（buNone）、または画像の行頭記号（buBlip）で文字として
+    表せない場合は None を返す。
+
+    探す順序は、指定が強いほうから
+    レイアウトの本文プレースホルダー → マスターの本文プレースホルダー →
+    マスターの本文用テキストスタイル（p:txStyles/p:bodyStyle）。
+    """
+    layout = slide.slide_layout
+    master = layout.slide_master
+
+    sources = []
+    for container in (layout, master):
+        placeholder = find_body_placeholder(container)
+        if placeholder is not None and placeholder.has_text_frame:
+            list_style = placeholder.text_frame._txBody.find(qn('a:lstStyle'))
+            if list_style is not None:
+                sources.append(list_style)
+
+    tx_styles = master._element.find(qn('p:txStyles'))
+    if tx_styles is not None:
+        body_style = tx_styles.find(qn('p:bodyStyle'))
+        if body_style is not None:
+            sources.append(body_style)
+
+    for source in sources:
+        properties = source.find(qn(f'a:lvl{level + 1}pPr'))
+        if properties is None:
+            continue
+        if (properties.find(qn('a:buNone')) is not None
+                or properties.find(qn('a:buBlip')) is not None):
+            return None
+        char = properties.find(qn('a:buChar'))
+        if char is not None:
+            return char, properties.find(qn('a:buFont'))
+    return None
+
+
+def mark_as_bullet(paragraph: _Paragraph, slide: Slide, level: int = 0) -> None:
+    """箇条書きの段落に、行頭記号を明示的に書き込む
+
+    本文プレースホルダーでは行頭記号がレイアウトから継承され、平文の段落にも
+    同じ記号が付く。そのためXML上は平文と箇条書きを区別できず、PPTXから
+    Markdownへ戻すときに、すべてが箇条書きになってしまう。
+
+    実際に描かれるのと同じ記号を段落へ書き戻すことで、**見た目を変えずに**
+    「この段落は箇条書きである」という情報を残す。継承値が読み取れない場合や
+    画像の行頭記号を使うテンプレートでは何もしない（見た目を保つほうを優先）。
+    """
+    bullet = inherited_bullet(slide, level)
+    if bullet is None:
+        return
+
+    char, font = bullet
+    elements = [copy.deepcopy(char)]
+    if font is not None:
+        elements.insert(0, copy.deepcopy(font))
+    _set_bullet(paragraph, *elements)
 
 
 def apply_auto_numbering(
