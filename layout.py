@@ -54,10 +54,16 @@ class SlideLayout:
     body_width: Length | None = None
 
     @classmethod
-    def from_presentation(cls, prs) -> SlideLayout:
+    def from_presentation(cls, prs, content_layout=None) -> SlideLayout:
+        """スライドサイズと本文プレースホルダーから配置寸法を導く
+
+        content_layout には実際に本文で使うレイアウトを渡す。省略した場合は
+        1つ目のマスターの2番目のレイアウトを見る（従来どおりの動作）。
+        """
         left = top = body_width = None
         try:
-            body = prs.slide_layouts[1].placeholders[1]
+            layout = content_layout if content_layout is not None else prs.slide_layouts[1]
+            body = layout.placeholders[1]
             left = Emu(int(body.left))
             top = Emu(int(body.top))
             body_width = Emu(int(body.width))
