@@ -22,10 +22,10 @@ from processors import (
     process_hr,
     process_blockquote,
     process_image,
-    process_table,
     process_code_or_mermaid,
     process_text
 )
+from table_render import process_table
 
 # スライドへ変換する対象のHTMLタグ
 TARGET_TAGS = ['h1', 'h2', 'h3', 'hr', 'p', 'li', 'img', 'pre', 'table', 'blockquote']

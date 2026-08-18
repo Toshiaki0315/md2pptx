@@ -11,6 +11,7 @@ source = [
     "md2pptx",
     "generator",
     "processors",
+    "table_render",
     "utils",
     "layout",
     "text_metrics",
