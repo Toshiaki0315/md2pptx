@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from pptx.util import Emu, Inches, Length
 
+from utils import find_body_placeholder
+
 # --- プレースホルダーが取得できない場合の既定値（絶対値） ---
 # 余白は「紙面が大きくなっても広げない」ほうが自然なため、割合ではなく絶対値で持つ。
 
@@ -63,10 +65,11 @@ class SlideLayout:
         left = top = body_width = None
         try:
             layout = content_layout if content_layout is not None else prs.slide_layouts[1]
-            body = layout.placeholders[1]
-            left = Emu(int(body.left))
-            top = Emu(int(body.top))
-            body_width = Emu(int(body.width))
+            body = find_body_placeholder(layout)
+            if body is not None:
+                left = Emu(int(body.left))
+                top = Emu(int(body.top))
+                body_width = Emu(int(body.width))
         except Exception:
             # 本文プレースホルダーを持たないテンプレートでは既定値を使う
             pass

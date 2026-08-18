@@ -3277,9 +3277,16 @@ class TestExtractEdgeCases:
 @pytest.fixture
 def template_factory(tmp_path):
     """検証用のテンプレートPPTXを作る"""
-    def make(name="template.pptx", reorder=None, width_in=13.333, height_in=7.5):
+    def make(name="template.pptx", reorder=None, width_in=13.333, height_in=7.5,
+             body_idx=None):
         prs = Presentation()
         prs.slide_width, prs.slide_height = Inches(width_in), Inches(height_in)
+        if body_idx is not None:
+            # 本文枠の idx を振り直す（Googleスライドから書き出したテンプレートを想定）
+            for layout in prs.slide_layouts:
+                for ph in layout.placeholders:
+                    if ph.placeholder_format.idx == 1:
+                        ph._element.nvSpPr.nvPr.ph.set('idx', str(body_idx))
         if reorder:
             # レイアウトの並び順を入れ替える（社内テンプレートを想定）
             id_list = prs.slide_master.slide_layouts._sldLayoutIdLst
@@ -3552,6 +3559,79 @@ class TestBodyPlaceholderFallback:
 
         with pytest.raises(TemplateError, match="本文を書き込めるレイアウトがありません"):
             PPTXGenerator(base_config)
+
+
+class TestNonStandardBodyIndex:
+    """本文枠の idx が 1 でないテンプレート（Googleスライドからの書き出しなど）
+
+    以前は本文枠の探し方が箇所ごとに違い、idx=1 を決め打ちしている場所が
+    残っていた。そのため PPTXGenerator の生成時に弾かれたり、水平線の
+    スライドで KeyError になったりしていた。
+    """
+
+    def _config(self, base_config, template_factory):
+        base_config["slides"]["template_path"] = template_factory(body_idx=12)
+        return base_config
+
+    def test_template_is_accepted(self, base_config, template_factory):
+        """idx=1 が無くてもテンプレートとして受け付ける"""
+        gen = PPTXGenerator(self._config(base_config, template_factory))
+
+        assert find_body_placeholder(gen.slide_layouts["content"]) is not None
+
+    def test_body_text_is_written(self, base_config, tmp_path, template_factory):
+        """本文が idx=1 以外のプレースホルダーに書き込まれる"""
+        gen = PPTXGenerator(self._config(base_config, template_factory))
+        gen.generate("## 中身\n本文\n", str(tmp_path / "out.pptx"))
+
+        body = find_body_placeholder(gen.prs.slides[0])
+        assert body.placeholder_format.idx == 12
+        assert "本文" in body.text_frame.text
+
+    def test_horizontal_rule_slide_is_created(self, base_config, tmp_path, template_factory):
+        """水平線のスライドでも落ちない（以前は KeyError になっていた）"""
+        gen = PPTXGenerator(self._config(base_config, template_factory))
+        gen.generate("## 中身\n本文\n\n---\n\n続き\n", str(tmp_path / "out.pptx"))
+
+        bodies = [find_body_placeholder(s).text_frame.text for s in gen.prs.slides]
+        assert "続き" in bodies[1]
+
+    def test_content_area_follows_the_template(self, base_config, template_factory):
+        """画像・表の配置も idx=1 以外の本文枠に追従する"""
+        gen = PPTXGenerator(self._config(base_config, template_factory))
+        body = find_body_placeholder(gen.slide_layouts["content"])
+
+        assert gen.layout.content_left == body.left
+
+
+class TestBodyPlaceholderMissingAtRuntime:
+    """本文枠が見つからないままスライドを組み立てる場合
+
+    本文はテキストボックスに書き出されるため、プレースホルダーを
+    前提にした寸法補正は何もせずに諦める（例外にしない）。
+    """
+
+    def test_start_slide_skips_the_size_fix(self, gen, mocker):
+        """見出しスライドの枠補正を飛ばす"""
+        mocker.patch("processors.find_body_placeholder", return_value=None)
+
+        gen.generate("## 中身\n本文\n", "/dev/null")
+
+        assert gen.prs.slides[0].shapes  # 例外にならずスライドは作られる
+
+    def test_hr_slide_skips_the_size_fix(self, gen, mocker):
+        """水平線スライドの枠補正を飛ばす"""
+        mocker.patch("processors.find_body_placeholder", return_value=None)
+
+        gen.generate("## 中身\n本文\n\n---\n\n続き\n", "/dev/null")
+
+        assert len(gen.prs.slides) == 2
+
+    def test_shrink_body_shape_does_nothing(self, gen_with_slide, mocker):
+        """本文枠の縮小も何もしない"""
+        mocker.patch("utils.find_body_placeholder", return_value=None)
+
+        shrink_body_shape(gen_with_slide.current_slide, Inches(4.0))  # 例外にならない
 
 
 class TestUseTemplateFonts:

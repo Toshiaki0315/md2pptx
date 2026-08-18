@@ -11,7 +11,7 @@ from pptx.util import Inches
 import markdown
 from bs4 import BeautifulSoup, Comment, Tag
 from layout import SlideLayout
-from utils import BODY_PLACEHOLDER_IDX, FontConfig, apply_font_style, find_body_placeholder
+from utils import FontConfig, apply_font_style, find_body_placeholder
 
 from processors import (
     add_slide_footers,
@@ -43,10 +43,12 @@ class TemplateError(Exception):
 
 
 def _has_body_placeholder(layout) -> bool:
-    """本文プレースホルダー（idx=1）を持つレイアウトかどうか"""
-    return any(
-        ph.placeholder_format.idx == BODY_PLACEHOLDER_IDX for ph in layout.placeholders
-    )
+    """本文を書き込めるプレースホルダーを持つレイアウトかどうか
+
+    判定は find_body_placeholder に委ねる。ここだけ idx=1 で判定すると、
+    実際には書き込めるテンプレートを門前払いしてしまう。
+    """
+    return find_body_placeholder(layout) is not None
 
 
 class PPTXGenerator:
