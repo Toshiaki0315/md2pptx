@@ -22,7 +22,9 @@ from text_metrics import (
     paginate_row_heights,
 )
 from utils import (
+    BODY_PLACEHOLDER_IDX,
     DEFAULT_IMAGE_DPI,
+    find_body_placeholder,
     FontConfig,
     ImageSource,
     apply_auto_numbering,
@@ -107,6 +109,25 @@ CELL_ALIGNMENTS = {
 CELL_MARGIN_H_PT = 0.1 * 72
 CELL_MARGIN_V_PT = 0.05 * 72
 
+def body_text_frame(generator: PPTXGenerator) -> Any:
+    """いま作ったスライドの本文枠を返す
+
+    本文プレースホルダーが無いレイアウト（表紙など）が使われた場合は、
+    本文を捨てずに済むよう、コンテンツ領域にテキストボックスを作る。
+    """
+    placeholder = find_body_placeholder(generator.current_slide)
+    if placeholder is not None:
+        return placeholder
+
+    layout = generator.layout
+    return generator.current_slide.shapes.add_textbox(
+        layout.content_left,
+        layout.content_top,
+        layout.content_width,
+        layout.body_height_for(layout.content_top),
+    )
+
+
 def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     """見出しタグの処理とスライド作成"""
     finalize_slide(generator)
@@ -125,7 +146,7 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
         for run in title_shape.text_frame.paragraphs[0].runs:
             apply_font_style(run, generator.fonts_conf.get(style_key, generator.fonts_conf.get('title')))
 
-    generator.current_body = generator.current_slide.placeholders[1].text_frame
+    generator.current_body = body_text_frame(generator).text_frame
     generator.current_body.word_wrap = True
     generator.current_body.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     generator.current_body.text = "" 
@@ -137,7 +158,7 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     if not generator.slides_conf.get('template_path'):
         try:
             layout = generator.layout
-            body_shape = generator.current_slide.placeholders[1]
+            body_shape = generator.current_slide.placeholders[BODY_PLACEHOLDER_IDX]
             # 継承値は書き込む前にすべて読み出す。一部だけ書き換えると継承が切れ、
             # 残りの値が0になってしまうため（shrink_body_shape の注意書きも参照）
             original_top = body_shape.top

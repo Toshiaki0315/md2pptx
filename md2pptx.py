@@ -71,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: 設定ファイル '{args.config}' が見つかりません。")
         return 1
 
+    config: dict[str, Any] = {}
     try:
         config = load_config(args.config)
 
@@ -94,7 +95,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     except TemplateError as e:
-        print(f"Error: テンプレート '{args.config}' の設定を確認してください。\n  - {e}")
+        # 設定ファイルではなくテンプレート自体の問題なので、テンプレートの場所を示す
+        template_path = (config.get('slides') or {}).get('template_path') or args.config
+        print(f"Error: テンプレート '{template_path}' の設定を確認してください。\n  - {e}")
         return 1
     except PermissionError:
         print(f"Error: '{args.output}' に書き込めません！PowerPointでファイルを開いたままにしていませんか？閉じてから再実行してください。")

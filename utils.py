@@ -14,6 +14,7 @@ from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any, Union
 
 from PIL import Image
+from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Length, Pt
@@ -36,6 +37,15 @@ if TYPE_CHECKING:
     from pptx.slide import Slide
     from pptx.text.text import TextFrame, _Paragraph, _Run
 
+#: タイトル・本文プレースホルダーの idx（PowerPointの慣習）
+TITLE_PLACEHOLDER_IDX = 0
+BODY_PLACEHOLDER_IDX = 1
+
+#: 本文・副題には使えないプレースホルダー（日付・フッター・ページ番号）
+NON_TEXT_PLACEHOLDER_TYPES = (
+    PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER,
+)
+
 #: config.yaml のフォント設定（name / size_pt / bold / color_rgb）
 FontConfig = dict[str, Any]
 
@@ -55,6 +65,31 @@ DEFAULT_INLINE_CODE_COLOR = [220, 20, 60]
 #: コードブロック枠の内側の余白と行送り
 CODE_BOX_MARGIN_INCHES = 0.2
 CODE_BOX_LINE_SPACING = 1.1
+
+def find_body_placeholder(container: Any) -> Any:
+    """本文（表紙では副題）を書き込むプレースホルダーを選ぶ
+
+    PowerPointの慣習である idx=1 を優先する。ただしGoogleスライドから
+    書き出したテンプレートなどでは idx が 0/2/12 のように振られており、
+    idx=1 が存在しない。その場合はタイトル・日付・フッター・ページ番号
+    以外の文字枠を使う。該当が無ければ None を返す。
+
+    引数にはスライドとレイアウトのどちらも渡せる。
+    """
+    placeholders = list(container.placeholders)
+    for placeholder in placeholders:
+        if placeholder.placeholder_format.idx == BODY_PLACEHOLDER_IDX:
+            return placeholder
+
+    for placeholder in placeholders:
+        if placeholder.placeholder_format.idx == TITLE_PLACEHOLDER_IDX:
+            continue
+        if placeholder.placeholder_format.type in NON_TEXT_PLACEHOLDER_TYPES:
+            continue
+        if placeholder.has_text_frame:
+            return placeholder
+    return None
+
 
 #: 段落の行頭記号を指定する要素（差し替え時に取り除く）
 BULLET_TAGS = ('a:buNone', 'a:buAutoNum', 'a:buChar')

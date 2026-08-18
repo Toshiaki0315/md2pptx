@@ -5,6 +5,7 @@
   - processors.py : Markdownの各タグに対応する処理
   - generator.py  : プレゼンテーション全体の組み立て
   - md2pptx.py    : CLI
+  - gui_config.py : GUI（gui.py）の設定値の組み立て
 """
 
 import base64
@@ -22,11 +23,13 @@ from PIL import Image
 from bs4 import BeautifulSoup
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.enum.text import PP_ALIGN
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Pt
 
 import extractor
+import make_template
 import md2pptx
 import mermaid_renderer
 import pptx2md
@@ -52,6 +55,14 @@ from text_metrics import (
 )
 from mermaid_renderer import MermaidRenderError, mermaid_conf, render_mermaid
 from md2pptx import apply_theme, load_config, main, parse_args, read_text_file
+from gui_config import (
+    FontSetting,
+    GuiSettings,
+    build_config,
+    default_output_path,
+    settings_from_config,
+    validate_inputs,
+)
 from processors import (
     process_blockquote,
     process_code_or_mermaid,
@@ -64,6 +75,7 @@ from processors import (
 )
 from utils import (
     DEFAULT_IMAGE_DPI,
+    find_body_placeholder,
     apply_auto_numbering,
     disable_bullet,
     set_alt_text,
@@ -3341,6 +3353,178 @@ class TestTemplate:
             gen._layout_by_index(1)
 
 
+class TestFindBodyPlaceholder:
+    """本文・副題を書き込む枠の選び方"""
+
+    def test_idx1_is_preferred(self):
+        layout = Presentation().slide_layouts[0]      # idx=0/1/10/11/12
+
+        assert find_body_placeholder(layout).placeholder_format.idx == 1
+
+    def test_falls_back_to_another_text_placeholder(self):
+        """Googleスライド由来のテンプレートのように idx=1 が無い場合"""
+        layout = Presentation().slide_layouts[3]      # idx=0/1/2/10/11/12
+        body = layout.placeholders[1]
+        body._element.getparent().remove(body._element)
+
+        assert find_body_placeholder(layout).placeholder_format.idx == 2
+
+    def test_title_and_footers_are_not_used(self):
+        layout = Presentation().slide_layouts[5]      # タイトルのみ（idx=0/10/11/12）
+
+        assert find_body_placeholder(layout) is None
+
+
+class TestLayoutsAcrossMasters:
+    """スライドマスターが複数あるテンプレート
+
+    python-pptx の prs.slide_layouts は1つ目のマスターしか返さないため、
+    本文用のレイアウトが2つ目以降にあると見つけられなかった。
+    """
+
+    def _layout(self, name, idxs=()):
+        layout = MagicMock()
+        layout.name = name
+        layout.placeholders = [
+            MagicMock(**{"placeholder_format.idx": idx}) for idx in idxs
+        ]
+        return layout
+
+    def _generator(self, base_config, masters):
+        gen = PPTXGenerator(base_config)
+        gen.prs = MagicMock()
+        gen.prs.slide_masters = [MagicMock(slide_layouts=layouts) for layouts in masters]
+        gen.slide_layouts = {}
+        return gen
+
+    def test_layout_name_is_found_in_the_second_master(self, base_config):
+        empty = self._layout("DEFAULT")
+        body = self._layout("TITLE_AND_BODY", idxs=(0, 1))
+        gen = self._generator(base_config, [[empty], [body]])
+        gen.slides_conf = {"layouts": {"title": "DEFAULT", "content": "TITLE_AND_BODY"}}
+
+        gen._resolve_layouts()
+
+        assert gen.slide_layouts["content"].name == "TITLE_AND_BODY"
+
+    def test_index_selection_continues_into_the_next_master(self, base_config):
+        first = self._layout("DEFAULT", idxs=(0,))
+        second = self._layout("TITLE_AND_BODY", idxs=(0, 1))
+        gen = self._generator(base_config, [[first], [second]])
+        gen.slides_conf = {}
+
+        gen._resolve_layouts()
+
+        assert gen.slide_layouts["title"].name == "DEFAULT"
+        assert gen.slide_layouts["content"].name == "TITLE_AND_BODY"
+
+    def test_body_fallback_looks_at_every_master(self, base_config, capsys):
+        """本文枠が2つ目のマスターにしか無い場合でも見つける"""
+        empty = self._layout("DEFAULT")
+        another = self._layout("1_DEFAULT")
+        body = self._layout("TITLE_AND_BODY", idxs=(0, 1))
+        gen = self._generator(base_config, [[empty, another], [body]])
+        gen.slides_conf = {}
+
+        gen._resolve_layouts()
+
+        assert gen.slide_layouts["content"].name == "TITLE_AND_BODY"
+        assert "本文枠が無いため" in capsys.readouterr().out
+
+    def test_error_lists_layouts_from_every_master(self, base_config):
+        gen = self._generator(base_config, [[self._layout("DEFAULT")], [self._layout("SECTION")]])
+        gen.slides_conf = {"layouts": {"content": "無い名前"}}
+
+        with pytest.raises(TemplateError, match="DEFAULT / SECTION"):
+            gen._resolve_layouts()
+
+
+class TestTitleSlidePlaceholders:
+    """表紙の副題（subtitle / author / date）の書き込み先"""
+
+    FRONT_MATTER = (
+        "---\n"
+        'title: "表紙"\n'
+        'subtitle: "副題"\n'
+        "---\n\n"
+        "## 中身\n本文\n"
+    )
+
+    def _title_slide(self, base_config, tmp_path, template, **slides):
+        base_config["slides"].update({"template_path": template, **slides})
+        gen = PPTXGenerator(base_config)
+        gen.generate(self.FRONT_MATTER, str(tmp_path / "out.pptx"))
+        return gen.prs.slides[0]
+
+    def test_subtitle_uses_another_placeholder_when_idx1_is_missing(
+        self, base_config, tmp_path
+    ):
+        """副題がidx=1でないテンプレート（Googleスライド由来など）でも書き込む"""
+        prs = Presentation()
+        layout = prs.slide_layouts[3]           # idx=0/1/2 を持つレイアウト
+        body = layout.placeholders[1]
+        body._element.getparent().remove(body._element)   # idx=1 だけ取り除く
+        path = tmp_path / "no_idx1.pptx"
+        prs.save(str(path))
+
+        slide = self._title_slide(
+            base_config, tmp_path, str(path),
+            layouts={"title": layout.name, "content": "Title and Content"},
+        )
+
+        subtitle = slide.placeholders[2]
+        assert subtitle.text_frame.text == "副題"
+
+    def test_missing_subtitle_placeholder_warns_instead_of_failing(
+        self, base_config, tmp_path, template_factory, capsys
+    ):
+        """副題を書ける枠が無くても変換は止まらない"""
+        slide = self._title_slide(
+            base_config, tmp_path, template_factory(),
+            layouts={"title": "Title Only", "content": "Title and Content"},
+        )
+
+        assert slide.shapes.title.text_frame.text == "表紙"
+        assert "副題" in capsys.readouterr().out
+
+
+class TestBodyWithoutPlaceholder:
+    """本文枠が無いレイアウトが使われた場合でも本文を捨てない"""
+
+    def test_h1_slide_gets_a_textbox(self, base_config, tmp_path, template_factory):
+        base_config["slides"].update({
+            "template_path": template_factory(),
+            "layouts": {"title": "Title Only", "content": "Title and Content"},
+        })
+
+        gen = PPTXGenerator(base_config)
+        gen.generate("# 表紙\n本文のテキスト\n", str(tmp_path / "out.pptx"))
+
+        slide = gen.prs.slides[0]
+        assert slide.shapes.title.text_frame.text == "表紙"
+        textboxes = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.TEXT_BOX]
+        assert any("本文のテキスト" in box.text_frame.text for box in textboxes)
+
+
+class TestTemplateWithSlides:
+    """中身が入ったファイルをテンプレートに指定した場合"""
+
+    def test_existing_slides_are_reported(self, base_config, tmp_path, capsys):
+        prs = Presentation()
+        prs.slides.add_slide(prs.slide_layouts[0])
+        path = tmp_path / "deck.pptx"
+        prs.save(str(path))
+        base_config["slides"]["template_path"] = str(path)
+
+        gen = PPTXGenerator(base_config)
+        gen.generate("## 見出し\n本文\n", str(tmp_path / "out.pptx"))
+
+        captured = capsys.readouterr().out
+        assert "既存のスライドが1枚あります" in captured
+        # 既存のスライドは消さず、生成分をその後ろに足す
+        assert len(gen.prs.slides) == 2
+
+
 class TestBodyPlaceholderFallback:
     """本文枠を持たないレイアウトが選ばれた場合"""
 
@@ -3454,3 +3638,360 @@ class TestTemplateErrorInCli:
         captured = capsys.readouterr().out
         assert "無いレイアウト" in captured
         assert "使用できるレイアウト" in captured
+
+    def test_error_points_at_the_template_not_the_config(self, tmp_path, capsys, template_factory):
+        """設定ファイルではなくテンプレートの場所を示す（GUIでは設定が一時ファイルのため）"""
+        md = tmp_path / "in.md"
+        md.write_text("## 見出し\n", encoding="utf-8")
+        template = template_factory()
+        conf = tmp_path / "tmp1234.yaml"
+        conf.write_text(
+            f"slides:\n  template_path: '{template}'\n  layouts:\n    content: '無いレイアウト'\n",
+            encoding="utf-8",
+        )
+
+        assert main([str(md), "-o", str(tmp_path / "o.pptx"), "-c", str(conf)]) == 1
+
+        captured = capsys.readouterr().out
+        assert str(template) in captured
+        assert "tmp1234.yaml" not in captured
+
+
+# =============================================================================
+# GUI (gui_config.py)
+# =============================================================================
+
+
+class TestGuiBuildConfig:
+    """画面の入力内容から config.yaml 相当の設定を組み立てる"""
+
+    def test_default_settings_produce_valid_config(self):
+        config = build_config(GuiSettings())
+
+        result = validate_config(config)
+        assert result.errors == [] and result.warnings == []
+
+    def test_template_settings_produce_valid_config(self, template_factory):
+        settings = GuiSettings(
+            use_template=True,
+            template_path=str(template_factory()),
+            layout_title="Title Slide",
+            layout_content="Title and Content",
+            footer_text="社外秘",
+            footer_date=True,
+        )
+
+        config = build_config(settings)
+
+        assert validate_config(config).errors == []
+        assert config["slides"]["template_path"] == settings.template_path
+        assert config["slides"]["layouts"] == {
+            "title": "Title Slide",
+            "content": "Title and Content",
+        }
+        # テンプレートの画角を尊重するため、画角は書き出さない
+        assert "layout" not in config["slides"]
+
+    def test_aspect_is_written_without_template(self):
+        config = build_config(GuiSettings(aspect="4:3"))
+
+        assert config["slides"]["layout"] == "4:3"
+        assert "template_path" not in config["slides"]
+
+    def test_template_path_ignored_when_checkbox_off(self):
+        config = build_config(GuiSettings(use_template=False, template_path="company.pptx"))
+
+        assert "template_path" not in config["slides"]
+
+    def test_layouts_omitted_when_names_are_blank(self):
+        config = build_config(GuiSettings(use_template=True, template_path="t.pptx"))
+
+        assert "layouts" not in config["slides"]
+
+    def test_fonts_omitted_when_using_template_fonts(self):
+        settings = GuiSettings(
+            use_template=True, template_path="t.pptx", use_template_fonts=True
+        )
+
+        assert "fonts" not in build_config(settings)
+
+    def test_blank_font_fields_are_omitted(self):
+        settings = GuiSettings()
+        settings.fonts["body"] = FontSetting(name="  ", size_pt=0)
+
+        fonts = build_config(settings)["fonts"]
+
+        assert "body" not in fonts
+
+    def test_inline_code_follows_code_block_font(self):
+        fonts = build_config(GuiSettings())["fonts"]
+
+        assert fonts["inline_code"] == {"name": fonts["code_block"]["name"]}
+
+    def test_footer_omitted_when_empty(self):
+        assert "footer" not in build_config(GuiSettings())["slides"]
+
+    def test_footer_written_when_specified(self):
+        settings = GuiSettings(footer_text=" 社外秘 ", footer_date=True, footer_on_title=True)
+
+        footer = build_config(settings)["slides"]["footer"]
+
+        assert footer == {"text": "社外秘", "date": True, "show_on_title": True}
+
+    def test_endpoint_omitted_unless_kroki(self):
+        config = build_config(GuiSettings(mermaid_renderer="off"))
+
+        assert config["mermaid"] == {"renderer": "off"}
+
+    def test_theme_colors_are_written_as_lists(self):
+        config = build_config(GuiSettings(accent_color=(1, 2, 3)))
+
+        assert config["theme"]["accent_color"] == [1, 2, 3]
+
+
+class TestGuiSettingsFromConfig:
+    """config.yaml を画面の入力内容に読み込む"""
+
+    def test_round_trip_keeps_values(self):
+        original = GuiSettings(
+            use_template=True,
+            template_path="company.pptx",
+            h3_as="slide",
+            show_slide_number=False,
+            use_template_fonts=False,
+            layout_title="表紙",
+            layout_content="本文",
+            footer_text="社外秘",
+            footer_date=True,
+            footer_on_title=True,
+            accent_color=(10, 20, 30),
+            text_color=(40, 50, 60),
+            code_bg_color=(70, 80, 90),
+            mermaid_renderer="local",
+            image_height_inches=4.0,
+            image_downscale=False,
+            image_dpi=96,
+        )
+
+        restored = settings_from_config(build_config(original))
+
+        for field_name in (
+            "use_template", "template_path", "h3_as", "show_slide_number",
+            "layout_title", "layout_content", "footer_text", "footer_date",
+            "footer_on_title", "accent_color", "text_color", "code_bg_color",
+            "mermaid_renderer", "image_height_inches", "image_downscale", "image_dpi",
+        ):
+            assert getattr(restored, field_name) == getattr(original, field_name), field_name
+
+    def test_reads_actual_config_yaml(self):
+        with open("config.yaml", encoding="utf-8") as f:
+            settings = settings_from_config(yaml.safe_load(f))
+
+        assert settings.aspect == "16:9"
+        assert settings.fonts["title_h1"].name == "Meiryo"
+        assert settings.fonts["title_h1"].size_pt == 44
+        assert settings.accent_color == (0, 112, 192)
+
+    def test_invalid_values_fall_back_to_defaults(self):
+        config = {
+            "slides": {"layout": "A5", "h3_as": 3, "show_slide_number": "yes"},
+            "theme": {"accent_color": [0, 300, 0]},
+            "images": {"dpi": "高い"},
+            "mermaid": {"renderer": "unknown"},
+            "fonts": {"body": {"size_pt": "18"}},
+        }
+
+        settings = settings_from_config(config)
+        defaults = GuiSettings()
+
+        assert settings.aspect == defaults.aspect
+        assert settings.h3_as == defaults.h3_as
+        assert settings.show_slide_number == defaults.show_slide_number
+        assert settings.accent_color == defaults.accent_color
+        assert settings.image_dpi == defaults.image_dpi
+        assert settings.mermaid_renderer == defaults.mermaid_renderer
+        assert settings.fonts["body"].size_pt == defaults.fonts["body"].size_pt
+
+    def test_empty_config_keeps_defaults(self):
+        assert settings_from_config(None) == GuiSettings()
+
+    def test_footer_date_as_text_turns_the_checkbox_on(self):
+        settings = settings_from_config({"slides": {"footer": {"date": "2026-08-18"}}})
+
+        assert settings.footer_date is True
+
+
+class TestGuiInputValidation:
+    """変換を始める前の入力チェック"""
+
+    def test_default_output_path_follows_input(self):
+        assert default_output_path("docs/資料.md") == "docs/資料.pptx"
+        assert default_output_path("/tmp/no.extension/report") == "/tmp/no.extension/report.pptx"
+        assert default_output_path("") == "output.pptx"
+
+    def test_valid_settings_have_no_errors(self, tmp_path):
+        md = tmp_path / "in.md"
+        md.write_text("## 見出し\n", encoding="utf-8")
+
+        settings = GuiSettings(input_path=str(md), output_path=str(tmp_path / "out.pptx"))
+
+        assert validate_inputs(settings) == []
+
+    def test_missing_input_is_reported(self):
+        errors = validate_inputs(GuiSettings(output_path="out.pptx"))
+
+        assert any("Markdownファイル" in message for message in errors)
+
+    def test_missing_file_is_reported(self, tmp_path):
+        settings = GuiSettings(
+            input_path=str(tmp_path / "無い.md"), output_path="out.pptx"
+        )
+
+        assert any("見つかりません" in message for message in validate_inputs(settings))
+
+    def test_missing_template_is_reported(self, tmp_path):
+        md = tmp_path / "in.md"
+        md.write_text("## 見出し\n", encoding="utf-8")
+        settings = GuiSettings(
+            input_path=str(md), output_path="out.pptx", use_template=True
+        )
+
+        assert any("テンプレート" in message for message in validate_inputs(settings))
+
+    def test_missing_template_file_is_reported(self, tmp_path):
+        md = tmp_path / "in.md"
+        md.write_text("## 見出し\n", encoding="utf-8")
+        settings = GuiSettings(
+            input_path=str(md),
+            output_path="out.pptx",
+            use_template=True,
+            template_path=str(tmp_path / "無い.pptx"),
+        )
+
+        assert any("見つかりません" in message for message in validate_inputs(settings))
+
+    def test_output_extension_is_checked(self, tmp_path):
+        md = tmp_path / "in.md"
+        md.write_text("## 見出し\n", encoding="utf-8")
+
+        settings = GuiSettings(input_path=str(md), output_path="out.ppt")
+
+        assert any(".pptx" in message for message in validate_inputs(settings))
+
+    def test_blank_output_is_reported(self, tmp_path):
+        md = tmp_path / "in.md"
+        md.write_text("## 見出し\n", encoding="utf-8")
+
+        settings = GuiSettings(input_path=str(md), output_path="  ")
+
+        assert any("出力ファイル名" in message for message in validate_inputs(settings))
+
+
+# =============================================================================
+# テンプレート作成 (make_template.py)
+# =============================================================================
+
+
+class TestMakeTemplate:
+    """完成した資料から書式だけのテンプレートを作る"""
+
+    def _deck(self, tmp_path, slides=3, name="deck.pptx"):
+        prs = Presentation()
+        for _ in range(slides):
+            prs.slides.add_slide(prs.slide_layouts[1])
+        path = tmp_path / name
+        prs.save(str(path))
+        return path
+
+    def test_slides_are_removed(self, tmp_path):
+        deck = self._deck(tmp_path)
+        out = tmp_path / "template.pptx"
+
+        removed = make_template.create_template(str(deck), str(out))
+
+        assert removed == 3
+        assert len(Presentation(str(out)).slides) == 0
+
+    def test_layouts_and_slide_size_are_kept(self, tmp_path):
+        prs = Presentation()
+        prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+        prs.slides.add_slide(prs.slide_layouts[0])
+        deck = tmp_path / "deck.pptx"
+        prs.save(str(deck))
+        out = tmp_path / "template.pptx"
+
+        make_template.create_template(str(deck), str(out))
+
+        template = Presentation(str(out))
+        assert len(template.slide_layouts) == len(prs.slide_layouts)
+        assert template.slide_width == Inches(13.333)
+
+    def test_generated_template_is_usable(self, base_config, tmp_path):
+        """作ったテンプレートで変換すると、生成した分だけのスライドになる"""
+        deck = self._deck(tmp_path, slides=5)
+        template = tmp_path / "template.pptx"
+        make_template.create_template(str(deck), str(template))
+
+        base_config["slides"]["template_path"] = str(template)
+        gen = PPTXGenerator(base_config)
+        gen.generate("## 見出し\n本文\n", str(tmp_path / "out.pptx"))
+
+        assert len(gen.prs.slides) == 1
+
+    def test_overwriting_the_source_is_refused(self, tmp_path):
+        deck = self._deck(tmp_path)
+
+        with pytest.raises(ValueError, match="上書き"):
+            make_template.create_template(str(deck), str(deck))
+
+        assert len(Presentation(str(deck)).slides) == 3
+
+    def test_default_output_path(self):
+        assert make_template.default_output_path("資料.pptx") == "資料-template.pptx"
+        assert make_template.default_output_path("deck") == "deck-template.pptx"
+
+    def test_cli_reports_success(self, tmp_path, capsys):
+        deck = self._deck(tmp_path, slides=2)
+
+        assert make_template.main([str(deck)]) == 0
+
+        assert "スライド2枚" in capsys.readouterr().out
+        assert (tmp_path / "deck-template.pptx").exists()
+
+    def test_cli_accepts_output_option(self, tmp_path):
+        deck = self._deck(tmp_path)
+        out = tmp_path / "別名.pptx"
+
+        assert make_template.main([str(deck), "-o", str(out)]) == 0
+        assert out.exists()
+
+    def test_cli_reports_missing_input(self, tmp_path, capsys):
+        assert make_template.main([str(tmp_path / "無い.pptx")]) == 1
+
+        assert "見つかりません" in capsys.readouterr().out
+
+    def test_cli_refuses_to_overwrite_the_source(self, tmp_path, capsys):
+        deck = self._deck(tmp_path)
+
+        assert make_template.main([str(deck), "-o", str(deck)]) == 1
+
+        assert "上書き" in capsys.readouterr().out
+
+    def test_cli_reports_broken_file(self, tmp_path, capsys):
+        broken = tmp_path / "broken.pptx"
+        broken.write_text("これはPPTXではありません", encoding="utf-8")
+
+        assert make_template.main([str(broken)]) == 1
+
+        assert "テンプレートを作成できませんでした" in capsys.readouterr().out
+
+    def test_cli_reports_locked_output(self, tmp_path, capsys, monkeypatch):
+        deck = self._deck(tmp_path)
+        monkeypatch.setattr(
+            make_template, "create_template",
+            MagicMock(side_effect=PermissionError()),
+        )
+
+        assert make_template.main([str(deck)]) == 1
+
+        assert "書き込めません" in capsys.readouterr().out

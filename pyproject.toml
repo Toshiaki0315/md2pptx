@@ -18,6 +18,8 @@ source = [
     "config_schema",
     "extractor",
     "pptx2md",
+    "gui_config",
+    "make_template",
 ]
 
 [tool.mypy]

@@ -11,7 +11,7 @@ from pptx.util import Inches
 import markdown
 from bs4 import BeautifulSoup, Comment, Tag
 from layout import SlideLayout
-from utils import FontConfig, apply_font_style
+from utils import BODY_PLACEHOLDER_IDX, FontConfig, apply_font_style, find_body_placeholder
 
 from processors import (
     add_slide_footers,
@@ -32,9 +32,6 @@ TARGET_TAGS = ['h1', 'h2', 'h3', 'hr', 'p', 'li', 'img', 'pre', 'table', 'blockq
 
 # スライドレイアウトの用途と、名前が指定されない場合に使う既定の位置
 DEFAULT_LAYOUT_INDEXES = {'title': 0, 'content': 1}
-
-# 本文プレースホルダーの idx（PowerPointの慣習）
-BODY_PLACEHOLDER_IDX = 1
 
 # use_template_fonts の指定時も残すフォント設定
 # 等幅フォントや表見出しの文字色は、体裁ではなく可読性のために必要なもの
@@ -84,6 +81,14 @@ class PPTXGenerator:
         template_path = self.slides_conf.get('template_path')
         if template_path and os.path.exists(template_path):
             self.prs = Presentation(template_path)
+            # 完成済みの資料をテンプレートに指定すると、その中身がそのまま残る。
+            # 気付かないまま「枚数が合わない」となりやすいので知らせる。
+            if len(self.prs.slides) > 0:
+                print(
+                    f"Warning: テンプレートに既存のスライドが{len(self.prs.slides)}枚あります。"
+                    "生成したスライドはその後ろに追加されます。\n"
+                    "         書式だけを使いたい場合は、中身を消したファイルか .potx を指定してください。"
+                )
         else:
             self.prs = Presentation()
             width, height = self._get_slide_size(self.slides_conf.get('layout', '16:9'))
@@ -101,7 +106,17 @@ class PPTXGenerator:
         self._resolve_layouts()
 
         # 画像・表・コード枠の配置は、この寸法を基準に決める
-        self.layout = SlideLayout.from_presentation(self.prs)
+        # （基準は、実際に本文で使うレイアウトの本文枠）
+        self.layout = SlideLayout.from_presentation(self.prs, self.slide_layouts.get('content'))
+
+    def _all_layouts(self) -> list[Any]:
+        """全てのスライドマスターのレイアウト
+
+        prs.slide_layouts は1つ目のマスターのものしか返さない。Googleスライドから
+        書き出したファイルなどはマスターが複数あり、本文用のレイアウトが
+        2つ目以降のマスターに入っていることがある。
+        """
+        return [layout for master in self.prs.slide_masters for layout in master.slide_layouts]
 
     def _resolve_layouts(self) -> None:
         """見出しの種類ごとに使うスライドレイアウトを決める
@@ -122,7 +137,7 @@ class PPTXGenerator:
         self._ensure_body_placeholder()
 
     def _layout_by_name(self, kind: str, name: str):
-        for layout in self.prs.slide_layouts:
+        for layout in self._all_layouts():
             if layout.name == name:
                 return layout
         raise TemplateError(
@@ -131,11 +146,13 @@ class PPTXGenerator:
         )
 
     def _layout_by_index(self, index: int):
-        if index < len(self.prs.slide_layouts):
-            return self.prs.slide_layouts[index]
+        layouts = self._all_layouts()
+        if index < len(layouts):
+            return layouts[index]
         raise TemplateError(
-            f"テンプレートのレイアウトが足りません（{len(self.prs.slide_layouts)}個）。\n"
-            f"       slides.layouts で使用するレイアウト名を指定してください。"
+            f"テンプレートのレイアウトが足りません（{len(layouts)}個）。\n"
+            f"       slides.layouts で使用するレイアウト名を指定してください。\n"
+            f"       使用できるレイアウト: {self._layout_names()}"
         )
 
     def _ensure_body_placeholder(self) -> None:
@@ -148,7 +165,7 @@ class PPTXGenerator:
             return
 
         fallback = next(
-            (l for l in self.prs.slide_layouts if _has_body_placeholder(l)), None
+            (l for l in self._all_layouts() if _has_body_placeholder(l)), None
         )
         if fallback is None:
             raise TemplateError(
@@ -165,7 +182,7 @@ class PPTXGenerator:
         self.slide_layouts['content'] = fallback
 
     def _layout_names(self) -> str:
-        return ' / '.join(layout.name for layout in self.prs.slide_layouts)
+        return ' / '.join(layout.name for layout in self._all_layouts())
 
     def _get_slide_size(self, layout_str: str) -> tuple[int, int]:
         sizes = {
@@ -210,8 +227,14 @@ class PPTXGenerator:
             if 'author' in front_matter: subtitle_text.append(str(front_matter['author']))
             if 'date' in front_matter: subtitle_text.append(str(front_matter['date']))
             
-            if subtitle_text and len(self.current_slide.placeholders) > 1:
-                sub_shape = self.current_slide.placeholders[1]
+            sub_shape = find_body_placeholder(self.current_slide) if subtitle_text else None
+            if subtitle_text and sub_shape is None:
+                print(
+                    "Warning: 表紙のレイアウトに副題を書き込める枠が無いため、"
+                    "subtitle / author / date を省略しました。\n"
+                    "         slides.layouts.title で別のレイアウトを指定できます。"
+                )
+            if sub_shape is not None:
                 sub_shape.text_frame.word_wrap = True
                 sub_shape.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
                 sub_shape.text = "\n".join(subtitle_text)
