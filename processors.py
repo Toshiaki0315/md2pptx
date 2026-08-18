@@ -604,6 +604,7 @@ def table_row_metrics(
         metrics.append(TableRowMetrics(
             texts=[cell.get_text() for cell in cells],
             font_size_pt=float(conf.get('size_pt') or DEFAULT_TABLE_BODY_FONT['size_pt']),
+            font_name=conf.get('name') or DEFAULT_TABLE_BODY_FONT['name'],
         ))
     return metrics
 

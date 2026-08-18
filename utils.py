@@ -479,6 +479,10 @@ def _paragraph_metrics(paragraph: _Paragraph) -> ParagraphMetrics:
     spacing = paragraph.line_spacing
     line_spacing = float(spacing) if isinstance(spacing, (int, float)) else DEFAULT_LINE_SPACING
 
+    # 段落内で最初に見つかった書体を代表とする（1段落に複数の書体は稀なため）
+    names = [run.font.name for run in paragraph.runs if run.font.name]
+    font_name = names[0] if names else paragraph.font.name
+
     return ParagraphMetrics(
         text=paragraph.text,
         font_size_pt=font_size,
@@ -486,6 +490,7 @@ def _paragraph_metrics(paragraph: _Paragraph) -> ParagraphMetrics:
         line_spacing=line_spacing,
         space_after_pt=paragraph.space_after.pt if paragraph.space_after else 0.0,
         space_before_pt=paragraph.space_before.pt if paragraph.space_before else 0.0,
+        font_name=font_name,
     )
 
 
