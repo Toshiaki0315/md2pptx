@@ -22,7 +22,6 @@ from text_metrics import (
     paginate_row_heights,
 )
 from utils import (
-    BODY_PLACEHOLDER_IDX,
     DEFAULT_IMAGE_DPI,
     find_body_placeholder,
     FontConfig,
@@ -158,7 +157,9 @@ def process_heading(generator: PPTXGenerator, tag: Tag) -> None:
     if not generator.slides_conf.get('template_path'):
         try:
             layout = generator.layout
-            body_shape = generator.current_slide.placeholders[BODY_PLACEHOLDER_IDX]
+            body_shape = find_body_placeholder(generator.current_slide)
+            if body_shape is None:
+                return
             # 継承値は書き込む前にすべて読み出す。一部だけ書き換えると継承が切れ、
             # 残りの値が0になってしまうため（shrink_body_shape の注意書きも参照）
             original_top = body_shape.top
@@ -223,7 +224,7 @@ def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
         sp = generator.current_slide.shapes.title._element
         sp.getparent().remove(sp)
         
-    generator.current_body = generator.current_slide.placeholders[1].text_frame
+    generator.current_body = body_text_frame(generator).text_frame
     generator.current_body.word_wrap = True
     
     from pptx.enum.text import MSO_AUTO_SIZE
@@ -237,7 +238,9 @@ def process_hr(generator: PPTXGenerator, tag: Tag) -> None:
     if not generator.slides_conf.get('template_path'):
         try:
             layout = generator.layout
-            body_shape = generator.current_slide.placeholders[1]
+            body_shape = find_body_placeholder(generator.current_slide)
+            if body_shape is None:
+                return
             new_top = Inches(0.5)
             body_shape.left = layout.content_left
             body_shape.top = new_top

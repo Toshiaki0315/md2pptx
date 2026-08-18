@@ -336,7 +336,9 @@ def shrink_body_shape(
     残りの値が 0 になる。継承値を明示的に書き戻してから変更する必要がある。
     """
     try:
-        body_shape = slide.placeholders[1]
+        body_shape = find_body_placeholder(slide)
+        if body_shape is None:
+            return
         body_shape.left, body_shape.top = body_shape.left, body_shape.top
         body_shape.width = width
         if max_height:
@@ -428,9 +430,8 @@ def auto_shrink_text(slide: Slide | None) -> None:
     """
     if not slide: return
     try:
-        if len(slide.placeholders) <= 1: return
-        body = slide.placeholders[1]
-        if not body.has_text_frame: return
+        body = find_body_placeholder(slide)
+        if body is None or not body.has_text_frame: return
 
         tf = body.text_frame
         paragraphs = list(tf.paragraphs)
