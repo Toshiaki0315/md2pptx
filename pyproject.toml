@@ -19,8 +19,15 @@ source = [
     "extractor",
     "pptx2md",
     "gui_config",
+    "gui_deps",
+    "gui_runner",
     "make_template",
 ]
+
+# gui.py は tkinter に依存し、tkinter を含まないPython（pyenvの既定など）では
+# import すらできないため、計測対象から外す。画面に依存しない処理は
+# gui_config / gui_deps / gui_runner に切り出し、そちらで計測する。
+omit = ["gui.py"]
 
 [tool.mypy]
 # サードパーティ製ライブラリの型スタブは任意導入とし、

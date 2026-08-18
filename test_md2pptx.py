@@ -9,7 +9,10 @@
 """
 
 import base64
+import io
 import os
+import sys
+from dataclasses import replace
 from datetime import datetime
 import subprocess
 from io import BytesIO
@@ -29,6 +32,8 @@ from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Inches, Pt
 
 import extractor
+import gui_deps
+import gui_runner
 import make_template
 import md2pptx
 import mermaid_renderer
@@ -3658,7 +3663,10 @@ class TestTemplateErrorInCli:
 
 
 # =============================================================================
-# GUI (gui_config.py)
+# GUI (gui_config.py / gui_deps.py / gui_runner.py)
+#
+# gui.py 本体は tkinter に依存し、環境によっては import すらできないため、
+# 画面に依存しない処理をこれらのモジュールに分けてテストする。
 # =============================================================================
 
 
@@ -3995,3 +4003,192 @@ class TestMakeTemplate:
         assert make_template.main([str(deck)]) == 1
 
         assert "書き込めません" in capsys.readouterr().out
+
+
+class TestGuiDependencyCheck:
+    """起動前の依存ライブラリ確認（gui_deps.py）"""
+
+    def test_nothing_is_missing_in_this_environment(self):
+        """テストが動く環境では、必要なライブラリは揃っている"""
+        assert gui_deps.missing_dependencies() == []
+
+    def test_reports_pip_names(self, mocker):
+        """import名ではなく、pipで指定する名前を返す"""
+        mocker.patch("gui_deps.importlib.util.find_spec", return_value=None)
+
+        assert "python-pptx" in gui_deps.missing_dependencies()
+        assert "pptx" not in gui_deps.missing_dependencies()
+
+    def test_message_shows_how_to_install(self):
+        """案内文に、実行中のPythonでの導入手順が入る"""
+        message = gui_deps.dependency_message(["PyYAML"], "/app", "/usr/bin/python3")
+
+        assert "PyYAML" in message
+        assert "/usr/bin/python3 -m pip install -r /app/requirements.txt" in message
+        assert "-m venv .venv" in message
+
+    def test_exit_if_missing_passes_when_complete(self):
+        """揃っていれば何もしない"""
+        gui_deps.exit_if_missing("/app")
+
+    def test_exit_if_missing_stops_with_guidance(self, mocker):
+        """足りなければ案内を出して終了する"""
+        mocker.patch("gui_deps.missing_dependencies", return_value=["Pillow"])
+        stream = io.StringIO()
+
+        with pytest.raises(SystemExit) as excinfo:
+            gui_deps.exit_if_missing("/app", "/usr/bin/python3", stream)
+
+        assert excinfo.value.code == 1
+        assert "Pillow" in stream.getvalue()
+
+
+class TestGuiColorHelpers:
+    """画面の色見本と設定値の変換（gui_runner.py）"""
+
+    def test_rgb_to_hex(self):
+        assert gui_runner.rgb_to_hex((0, 112, 192)) == "#0070c0"
+
+    def test_hex_to_rgb(self):
+        assert gui_runner.hex_to_rgb("#0070c0") == (0, 112, 192)
+
+    def test_round_trip(self):
+        """カラーピッカーとの往復で値が変わらない"""
+        assert gui_runner.hex_to_rgb(gui_runner.rgb_to_hex((40, 44, 52))) == (40, 44, 52)
+
+
+class TestGuiOpenInFileManager:
+    """出力先をOSのファイラーで開く（gui_runner.py）"""
+
+    def _command(self, mocker, platform, os_name):
+        mocker.patch("gui_runner.sys.platform", platform)
+        mocker.patch("gui_runner.os.name", os_name)
+        run = mocker.patch("gui_runner.subprocess.run")
+
+        gui_runner.open_in_file_manager(os.path.join("out", "deck.pptx"))
+
+        return run.call_args[0][0]
+
+    def test_macos_selects_the_file(self, mocker):
+        assert self._command(mocker, "darwin", "posix")[:2] == ["open", "-R"]
+
+    def test_windows_selects_the_file(self, mocker):
+        assert self._command(mocker, "win32", "nt")[0] == "explorer"
+
+    def test_linux_opens_the_folder(self, mocker):
+        """xdg-open にファイルを渡すと関連付けアプリが開いてしまうため、フォルダを渡す"""
+        command = self._command(mocker, "linux", "posix")
+
+        assert command == ["xdg-open", "out"]
+
+    def test_linux_falls_back_to_current_folder(self, mocker):
+        mocker.patch("gui_runner.sys.platform", "linux")
+        mocker.patch("gui_runner.os.name", "posix")
+        run = mocker.patch("gui_runner.subprocess.run")
+
+        gui_runner.open_in_file_manager("deck.pptx")
+
+        assert run.call_args[0][0] == ["xdg-open", "."]
+
+
+class TestGuiConversionSetup:
+    """CLIを呼び出す準備（gui_runner.py）"""
+
+    def test_template_path_becomes_absolute(self, tmp_path, monkeypatch):
+        """相対パスのままだと、作業フォルダを移す変換でテンプレートを見失う"""
+        monkeypatch.chdir(tmp_path)
+        settings = GuiSettings(use_template=True, template_path="theme.pptx")
+
+        config = gui_runner.settings_to_config(settings)
+
+        assert config["slides"]["template_path"] == str(tmp_path / "theme.pptx")
+
+    def test_template_is_omitted_when_unused(self):
+        settings = GuiSettings(use_template=False, template_path="theme.pptx")
+
+        assert "template_path" not in gui_runner.settings_to_config(settings)["slides"]
+
+    def test_temp_config_is_readable_yaml(self):
+        """日本語を含む設定が、そのまま読み戻せる形で書かれる"""
+        path = gui_runner.write_temp_config({"slides": {"footer": {"text": "社外秘"}}})
+        try:
+            with open(path, encoding="utf-8") as f:
+                assert yaml.safe_load(f)["slides"]["footer"]["text"] == "社外秘"
+        finally:
+            os.unlink(path)
+
+    def test_command_uses_the_running_python(self):
+        """仮想環境から起動された場合に、その環境のライブラリを使う"""
+        command = gui_runner.build_command("in.md", "out.pptx", "conf.yaml")
+
+        assert command[0] == sys.executable
+        assert command[1].endswith("md2pptx.py")
+        assert command[2:] == ["in.md", "-o", "out.pptx", "-c", "conf.yaml"]
+
+
+class TestGuiRunConversion:
+    """GUIからCLIを実際に呼び出す（gui_runner.py）"""
+
+    def _settings(self, tmp_path, text="## 中身\n本文\n"):
+        source = tmp_path / "deck.md"
+        source.write_text(text, encoding="utf-8")
+        return GuiSettings(
+            input_path=str(source),
+            output_path=str(tmp_path / "out.pptx"),
+            mermaid_renderer="off",
+        )
+
+    def test_converts_and_reports_progress(self, tmp_path):
+        """変換が成功し、CLIの出力が1行ずつ渡る"""
+        lines = []
+
+        returncode, output_path = gui_runner.run_conversion(
+            self._settings(tmp_path), lines.append
+        )
+
+        assert returncode == 0
+        assert os.path.isfile(output_path)
+        assert any("Success" in line for line in lines)
+        assert not any(line.endswith("\n") for line in lines)
+
+    def test_reports_failure_from_the_cli(self, tmp_path):
+        """CLIが失敗した場合、終了コードとメッセージが伝わる"""
+        settings = self._settings(tmp_path)
+        settings = replace(settings, input_path=str(tmp_path / "missing.md"))
+        lines = []
+
+        returncode, _ = gui_runner.run_conversion(settings, lines.append)
+
+        assert returncode == 1
+        assert any("見つかりません" in line for line in lines)
+
+    def test_temp_config_is_removed(self, tmp_path, mocker):
+        """一時設定ファイルは変換後に消える"""
+        created = []
+        original = gui_runner.write_temp_config
+        mocker.patch(
+            "gui_runner.write_temp_config",
+            side_effect=lambda config: created.append(original(config)) or created[-1],
+        )
+
+        gui_runner.run_conversion(self._settings(tmp_path), lambda _line: None)
+
+        assert created and not os.path.exists(created[0])
+
+    def test_unexpected_failure_does_not_raise(self, tmp_path, mocker):
+        """予期せぬ失敗でも例外にせず、画面を操作不能にしない"""
+        mocker.patch("gui_runner.subprocess.Popen", side_effect=OSError("起動できません"))
+        lines = []
+
+        returncode, _ = gui_runner.run_conversion(self._settings(tmp_path), lines.append)
+
+        assert returncode == 1
+        assert "変換を実行できませんでした" in lines[0]
+
+    def test_temp_config_removal_failure_is_ignored(self, tmp_path, mocker):
+        """一時ファイルを消せなくても、変換結果は返す"""
+        mocker.patch("gui_runner.os.unlink", side_effect=OSError())
+
+        returncode, _ = gui_runner.run_conversion(self._settings(tmp_path), lambda _l: None)
+
+        assert returncode == 0

@@ -11,12 +11,9 @@ CLIとGUIで結果が食い違わない。
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import queue
-import subprocess
 import sys
-import tempfile
 import threading
 from functools import partial
 from typing import Any
@@ -24,56 +21,23 @@ from typing import Any
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
-#: 実行に必要なライブラリ（import名, pipでの名前）
-REQUIRED_MODULES = (
-    ('yaml', 'PyYAML'),
-    ('pptx', 'python-pptx'),
-    ('markdown', 'Markdown'),
-    ('bs4', 'beautifulsoup4'),
-    ('requests', 'requests'),
-    ('PIL', 'Pillow'),
-    ('pygments', 'Pygments'),
-)
+from gui_deps import exit_if_missing
 
+#: このスクリプトが置かれているディレクトリ（CLIと既定の設定ファイルの場所）
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def missing_dependencies() -> list[str]:
-    """未導入のライブラリ（pipでの名前）を返す"""
-    return [
-        package
-        for module, package in REQUIRED_MODULES
-        if importlib.util.find_spec(module) is None
-    ]
-
-
-def _exit_if_dependencies_missing() -> None:
-    """依存ライブラリが無い場合、導入方法を示して終了する
-
-    素の ModuleNotFoundError では、何をどう入れればよいか分かりにくいため。
-    """
-    missing = missing_dependencies()
-    if not missing:
-        return
-
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-    print(
-        'Error: 必要なライブラリが入っていません: ' + ', '.join(missing) + '\n'
-        '       次のコマンドで導入してください。\n\n'
-        f'         {sys.executable} -m pip install -r {os.path.join(app_dir, "requirements.txt")}\n\n'
-        '       システムのPythonを変えたくない場合は、仮想環境を作ってください。\n\n'
-        f'         cd {app_dir}\n'
-        f'         {sys.executable} -m venv .venv\n'
-        '         .venv/bin/pip install -r requirements.txt\n'
-        '         .venv/bin/python gui.py\n',
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-
-_exit_if_dependencies_missing()
+exit_if_missing(APP_DIR)
 
 import yaml  # noqa: E402  （上の確認を通ってから読み込む）
 
 from make_template import create_template
+from gui_runner import (
+    DEFAULT_CONFIG_PATH,
+    hex_to_rgb,
+    open_in_file_manager,
+    rgb_to_hex,
+    run_conversion,
+)
 from gui_config import (
     ASPECTS,
     FONT_LABELS,
@@ -88,33 +52,7 @@ from gui_config import (
     validate_inputs,
 )
 
-#: このスクリプトが置かれているディレクトリ（CLIと既定の設定ファイルの場所）
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CLI_PATH = os.path.join(APP_DIR, 'md2pptx.py')
-DEFAULT_CONFIG_PATH = os.path.join(APP_DIR, 'config.yaml')
-
 PADDING = 8
-
-
-def rgb_to_hex(color: RGB) -> str:
-    """(0, 112, 192) → '#0070c0'"""
-    return '#%02x%02x%02x' % color
-
-
-def hex_to_rgb(value: str) -> RGB:
-    """'#0070c0' → (0, 112, 192)"""
-    text = value.lstrip('#')
-    return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
-
-
-def open_in_file_manager(path: str) -> None:
-    """OSのファイラーで出力先を開く"""
-    if sys.platform == 'darwin':
-        subprocess.run(['open', '-R', path], check=False)
-    elif os.name == 'nt':
-        subprocess.run(['explorer', '/select,', os.path.normpath(path)], check=False)
-    else:
-        subprocess.run(['xdg-open', os.path.dirname(path) or '.'], check=False)
 
 
 class App:
@@ -694,49 +632,10 @@ class App:
 
     def _run_conversion(self, settings: GuiSettings) -> None:
         """別スレッドでCLIを呼び出し、出力を画面へ送る"""
-        config_path = ''
-        try:
-            input_path = os.path.abspath(settings.input_path)
-            output_path = os.path.abspath(settings.output_path)
-            config = build_config(settings)
-            if settings.use_template:
-                config['slides']['template_path'] = os.path.abspath(settings.template_path)
-
-            with tempfile.NamedTemporaryFile(
-                'w', suffix='.yaml', delete=False, encoding='utf-8'
-            ) as f:
-                yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
-                config_path = f.name
-
-            command = [sys.executable, CLI_PATH, input_path, '-o', output_path, '-c', config_path]
-            # Windowsで黒いコンソール画面が一瞬開くのを防ぐ
-            creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
-            # Markdown内の画像は相対パスで書かれているため、Markdownの場所を作業フォルダにする
-            process = subprocess.Popen(
-                command,
-                cwd=os.path.dirname(input_path) or None,
-                creationflags=creationflags,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,
-            )
-            assert process.stdout is not None
-            for line in process.stdout:
-                self.log_queue.put(('log', line.rstrip('\n')))
-            returncode = process.wait()
-            self.log_queue.put(('done', (returncode, output_path)))
-        except Exception as e:  # 予期せぬ失敗でも画面を操作不能にしない
-            self.log_queue.put(('log', f'Error: 変換を実行できませんでした: {e}'))
-            self.log_queue.put(('done', (1, settings.output_path)))
-        finally:
-            if config_path:
-                try:
-                    os.unlink(config_path)
-                except OSError:
-                    pass
+        returncode, output_path = run_conversion(
+            settings, lambda line: self.log_queue.put(('log', line))
+        )
+        self.log_queue.put(('done', (returncode, output_path)))
 
     def _drain_log_queue(self) -> None:
         """別スレッドからの出力を画面に反映する（100msごと）"""
