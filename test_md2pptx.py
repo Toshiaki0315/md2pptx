@@ -79,9 +79,9 @@ from processors import (
     process_heading,
     process_hr,
     process_image,
-    process_table,
     process_text,
 )
+from table_render import cell_alignment, process_table, table_row_metrics
 from utils import (
     DEFAULT_IMAGE_DPI,
     find_body_placeholder,
@@ -1327,7 +1327,7 @@ class TestProcessTable:
     )
     def test_cell_alignment_parsing(self, html, expected):
         """揃え指定の解釈（style属性・align属性の両方に対応する）"""
-        assert processors.cell_alignment(parse_html(html).td) is expected
+        assert cell_alignment(parse_html(html).td) is expected
 
     def test_layout_is_full_when_slide_is_empty(self, gen_with_slide):
         """テキストが無い場合は表を上部から配置する"""
@@ -4646,7 +4646,7 @@ class TestFontNameIsCarriedOver:
     def test_table_font_is_picked_up(self):
         """表の設定から書体名を取り出す"""
         rows = parse_md("| A |\n|---|\n| 1 |").find_all("tr")
-        metrics = processors.table_row_metrics(
+        metrics = table_row_metrics(
             rows, {"name": "見出し書体", "size_pt": 14}, {"name": "本文書体", "size_pt": 12}
         )
 
